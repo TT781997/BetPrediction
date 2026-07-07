@@ -336,12 +336,20 @@ class DataScraper:
         for lg in ["all"] + list(ligas or ESPN_LEAGUES):
             try:
                 r = self.s.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard",
-                               params={"dates": d.strftime("%Y%m%d")}, timeout=15)
+                               params={"dates": d.strftime("%Y%m%d"), "limit": 400}, timeout=20)
                 r.raise_for_status()
                 data = r.json()
             except Exception:
                 continue
-            liga = (data.get("leagues") or [{}])[0].get("name", lg)
+            topo = data.get("leagues") or []
+            liga_por_id = {}
+            for l in topo:
+                nome_l = l.get("name") or l.get("shortName") or ""
+                for ident in {str(l.get("id", "")),
+                              str(l.get("uid", "")).split("l:")[-1].split("~")[0]}:
+                    if ident and nome_l:
+                        liga_por_id[ident] = nome_l
+            liga_topo = topo[0].get("name") if (len(topo) == 1 and lg != "all") else None
             for ev in data.get("events", []):
                 try:
                     comp = ev["competitions"][0]
@@ -352,6 +360,14 @@ class DataScraper:
                     if mid in vistos:
                         continue
                     vistos.add(mid)
+                    lg_ev = ev.get("league")
+                    liga = (lg_ev.get("name") if isinstance(lg_ev, dict) else
+                            lg_ev if isinstance(lg_ev, str) else None)
+                    if not liga:
+                        uid = str(ev.get("uid", ""))
+                        if "l:" in uid:
+                            liga = liga_por_id.get(uid.split("l:")[-1].split("~")[0])
+                    liga = liga or liga_topo or ("?" if lg == "all" else lg)
                     jogos.append({"match_id": mid, "liga": liga,
                                   "home": casa["team"]["displayName"],
                                   "away": fora["team"]["displayName"],
@@ -504,10 +520,19 @@ class DataScraper:
         if overrides and overrides.get("lh") and overrides.get("la"):
             return {"lh": overrides["lh"], "la": overrides["la"], "fontes": "manual"}
         fontes, pesos_lh, pesos_la = [], [], []
-        u_map = {"Premier League": "EPL", "LaLiga": "La_liga", "Serie A": "Serie_A",
-                 "Bundesliga": "Bundesliga", "Ligue 1": "Ligue_1"}
-        if liga in u_map:
-            uh, ua = self.understat_team(home, u_map[liga]), self.understat_team(away, u_map[liga])
+        u_map = {"Premier League": "EPL", "English Premier League": "EPL",
+                 "LaLiga": "La_liga", "Spanish LaLiga": "La_liga",
+                 "Serie A": "Serie_A", "Italian Serie A": "Serie_A",
+                 "Bundesliga": "Bundesliga", "German Bundesliga": "Bundesliga",
+                 "Ligue 1": "Ligue_1", "French Ligue 1": "Ligue_1"}
+        lg_u = None
+        if fuzzproc:
+            hit = fuzzproc.extractOne(liga, list(u_map), scorer=fuzz.token_set_ratio, score_cutoff=80)
+            lg_u = u_map[hit[0]] if hit else None
+        else:
+            lg_u = u_map.get(liga)
+        if lg_u:
+            uh, ua = self.understat_team(home, lg_u), self.understat_team(away, lg_u)
             if uh and ua:
                 pesos_lh.append(((uh["xg5"] + ua["xga5"]) / 2 * 1.05, 0.6))   # +5% casa
                 pesos_la.append(((ua["xg5"] + uh["xga5"]) / 2 * 0.95, 0.6))
@@ -588,6 +613,8 @@ class OddsProvider:
         return self.cache["sports"]
 
     def sport_key_for(self, liga: str):
+        if not liga or liga in ("all", "?"):
+            return None
         sports = self._sports()
         if not (sports and fuzzproc):
             return None
@@ -798,10 +825,16 @@ def setup_ui():
         if linhas:
             st.caption(f"Fixtures via {st.session_state.get('radar_fonte','?')} · {len(linhas)} jogos · "
                        "para live, cola o URL do jogo no FotMob na aba seguinte.")
-            ocultar = st.checkbox("Ocultar jogos já terminados", value=True)
+            cA, cB = st.columns([1, 2])
+            ocultar = cA.checkbox("Ocultar jogos já terminados", value=True)
+            ordem = cB.radio("Ordenar por", ["Hora", "Melhor EV"], horizontal=True,
+                             help="'Melhor EV' põe no topo o jogo com o mercado de maior valor — "
+                                  "a leitura direta de 'qual a aposta'.")
             df = pd.DataFrame(linhas)
             if ocultar and "finished" in df.columns:
                 df = df[~df["finished"].fillna(False)]
+            if ordem == "Melhor EV" and "ev_val" in df.columns:
+                df = df.sort_values("ev_val", ascending=False, na_position="last")
             vis = df[["liga", "home", "away", "hora_utc", "lh", "la",
                       "p_home", "p_draw", "p_away", "p_over25", "p_btts",
                       "melhor_ev", "fontes"]].copy()
@@ -847,6 +880,14 @@ def setup_ui():
                            "mercado. Confirma a odd antes de fechar — pré-jogo mexe ao minuto.")
             else:
                 st.caption(f"Nenhum mercado com EV ≥ {CFG['ev_min']:.0%} nas odds recolhidas.")
+            with st.expander("🔧 Diagnóstico de fontes"):
+                sem_odds = sorted({l["liga"] for l in linhas if l.get("fontes") == "baseline"})
+                st.write({"fixtures": st.session_state.get("radar_fonte", "?"),
+                          "jogos com λ odds-implied": sum(1 for l in linhas
+                                                          if l.get("fontes") == "odds-implied"),
+                          "ligas em baseline (sem odds mapeadas)": sem_odds,
+                          "sports ativos na the-odds-api": (len(oddsp._sports())
+                                                            if oddsp.key else "sem chave")})
             if c2.button("Guardar previsões na BD"):
                 db.save_predictions([{"data": str(data_sel), "match_id": l["match_id"],
                                       "jogo": f'{l["home"]} vs {l["away"]}', "liga": l["liga"],
