@@ -9,8 +9,9 @@ Instalar e correr:
     export FOOTBALL_DATA_KEY=...                         # opcional (football-data.org, grátis)
     streamlit run app.py
 
-Sem Telegram/OddsAPI configurados a app funciona na mesma: alertas ficam só na BD
-e as odds podem ser introduzidas via odds.json ou manualmente na UI.
+As quatro chaves também podem ser coladas na barra lateral da app (⚙️ Configuração),
+que as guarda no quant_desk.db — dispensa variáveis de ambiente. Sem chaves a app
+funciona em modo degradado: alertas só na BD, odds via odds.json.
 """
 from __future__ import annotations
 
@@ -78,6 +79,8 @@ class Database:
                 resultado_final TEXT, pnl REAL, settled INTEGER DEFAULT 0, criado TEXT);
             CREATE TABLE IF NOT EXISTS calibration(
                 grupo TEXT PRIMARY KEY, fator REAL, n INTEGER, atualizado TEXT);
+            CREATE TABLE IF NOT EXISTS config(
+                chave TEXT PRIMARY KEY, valor TEXT);
             """)
 
     def _c(self):
@@ -118,6 +121,16 @@ class Database:
     def calibration(self) -> dict:
         with self._c() as c:
             return {g: f for g, f, *_ in c.execute("SELECT grupo,fator,n FROM calibration")}
+
+    def config_all(self) -> dict:
+        with self._c() as c:
+            return dict(c.execute("SELECT chave, valor FROM config").fetchall())
+
+    def set_config(self, valores: dict):
+        with self._c() as c:
+            for k, v in valores.items():
+                c.execute("INSERT INTO config(chave,valor) VALUES(?,?) "
+                          "ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor", (k, v or ""))
 
     def set_calibration(self, grupo: str, fator: float, n: int):
         with self._c() as c:
@@ -348,10 +361,10 @@ class DataScraper:
                 break
         return jogos
 
-    def fixtures_today(self, date: dt.date | None = None,
-                       ligas: list[str] | None = None) -> tuple[list[dict], str]:
+    def fixtures_today(self, date: dt.date | None = None, ligas: list[str] | None = None,
+                       fd_key: str | None = None) -> tuple[list[dict], str]:
         d = date or dt.date.today()
-        key = os.getenv("FOOTBALL_DATA_KEY")
+        key = (fd_key or "").strip() or os.getenv("FOOTBALL_DATA_KEY")
         if key:
             try:
                 j = self._football_data(d, key)
@@ -607,9 +620,9 @@ class OddsProvider:
 
 
 class Notifier:
-    def __init__(self):
-        self.token = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.chat = os.getenv("TELEGRAM_CHAT_ID")
+    def __init__(self, token: str | None = None, chat: str | None = None):
+        self.token = (token or "").strip() or os.getenv("TELEGRAM_BOT_TOKEN")
+        self.chat = (chat or "").strip() or os.getenv("TELEGRAM_CHAT_ID")
 
     def send(self, txt: str) -> bool:
         if not (self.token and self.chat):
@@ -663,7 +676,37 @@ def setup_ui():
         st.session_state.scraper = DataScraper()
     scraper: DataScraper = st.session_state.scraper
     engine = MathEngine(calib=db.calibration())
-    notifier = Notifier()
+
+    cfg_db = db.config_all()
+    with st.sidebar:
+        st.header("⚙️ Configuração")
+        st.caption("Prioridade: campo abaixo > variável de ambiente. Guardadas em texto simples "
+                   "no quant_desk.db local — mantém o ficheiro privado (.gitignore).")
+        k_odds = st.text_input("ODDS_API_KEY", type="password",
+                               value=os.getenv("ODDS_API_KEY", "") or cfg_db.get("odds_api_key", ""),
+                               help="the-odds-api.com — odds pré-jogo/live, priors implícitos e EV.")
+        k_fd = st.text_input("FOOTBALL_DATA_KEY", type="password",
+                             value=os.getenv("FOOTBALL_DATA_KEY", "") or cfg_db.get("football_data_key", ""),
+                             help="football-data.org — fixtures oficiais (fonte primária do Radar).")
+        k_tg_tok = st.text_input("TELEGRAM_BOT_TOKEN", type="password",
+                                 value=os.getenv("TELEGRAM_BOT_TOKEN", "") or cfg_db.get("tg_token", ""),
+                                 help="Token do bot (@BotFather).")
+        k_tg_chat = st.text_input("TELEGRAM_CHAT_ID",
+                                  value=os.getenv("TELEGRAM_CHAT_ID", "") or cfg_db.get("tg_chat", ""),
+                                  help="ID do chat/canal que recebe os alertas.")
+        cb1, cb2 = st.columns(2)
+        if cb1.button("Guardar chaves"):
+            db.set_config({"odds_api_key": k_odds, "football_data_key": k_fd,
+                           "tg_token": k_tg_tok, "tg_chat": k_tg_chat})
+            st.success("Guardadas.")
+        if cb2.button("Testar Telegram"):
+            ok = Notifier(k_tg_tok, k_tg_chat).send("✅ Quant Desk ligado.")
+            if ok:
+                st.success("Enviado — vê o Telegram.")
+            else:
+                st.error("Falhou: verifica token e chat_id.")
+
+    notifier = Notifier(k_tg_tok, k_tg_chat)
 
     tab_radar, tab_live, tab_alertas, tab_hist = st.tabs(
         ["📡 Radar Pré-Jogo", "🎯 Live Quant Desk", "🚨 Alertas EV+", "📚 Histórico & Auditoria"])
@@ -679,14 +722,15 @@ def setup_ui():
                                        "bra.1). O scraper tenta primeiro o código 'all' (tudo do dia); "
                                        "se a ESPN não o servir, itera esta lista. Acrescenta aqui "
                                        "pré-eliminatórias/ligas que faltem.")
-        if "odds_provider" not in st.session_state:
-            st.session_state.odds_provider = OddsProvider(os.getenv("ODDS_API_KEY"),
+        if st.session_state.get("odds_key") != k_odds or "odds_provider" not in st.session_state:
+            st.session_state.odds_provider = OddsProvider(k_odds.strip() or None,
                                                           "soccer_fifa_world_cup")
+            st.session_state.odds_key = k_odds
         oddsp: OddsProvider = st.session_state.odds_provider
         if c1.button("Correr pipeline do dia", type="primary") or "radar" not in st.session_state:
             try:
                 ligas = [x.strip() for x in ligas_txt.split(",") if x.strip()]
-                jogos, fonte_fix = scraper.fixtures_today(data_sel, ligas)
+                jogos, fonte_fix = scraper.fixtures_today(data_sel, ligas, fd_key=k_fd)
                 st.session_state.radar_fonte = fonte_fix
             except Exception as e:
                 st.error(f"Fixtures falharam: {e}")
@@ -846,8 +890,8 @@ def setup_ui():
                 st.progress(min(1.0, rev_w / kill_eff),
                             text=f"λ revelado {names[i]}: {rev_w:.3f} / morte {kill_eff:.2f} — {zona}")
 
-                sport = st.session_state.get("sport", "soccer_fifa_world_cup")
-                odds = OddsProvider(os.getenv("ODDS_API_KEY"), sport).get(names[0], names[1])
+                odds = st.session_state.get("odds_provider",
+                                             OddsProvider(None, "soccer_fifa_world_cup")).get(names[0], names[1])
                 rows, alertas = [], []
                 for mk, label in MARKET_LABELS.items():
                     p_ = probs[mk]
