@@ -19,6 +19,7 @@ import math
 import os
 import re
 import sqlite3
+import statistics
 import time
 import datetime as dt
 
@@ -42,7 +43,9 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Fi
 
 FACT = [math.factorial(k) for k in range(CFG["nmax"] + 1)]
 
-ESPN_LEAGUES = ["fifa.world", "uefa.champions", "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "por.1"]
+ESPN_LEAGUES = ["fifa.world", "uefa.champions", "uefa.europa", "uefa.europa.conf",
+                "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "por.1", "ned.1", "tur.1",
+                "sco.1", "bel.1", "usa.1", "bra.1", "arg.1", "nor.1", "swe.1", "jpn.1"]
 
 MARKET_LABELS = {
     "home": "Vitória Casa", "draw": "Empate", "away": "Vitória Fora",
@@ -205,6 +208,33 @@ class MathEngine:
     def ev(p: float, odd: float) -> float:
         return p * odd - 1.0
 
+    @staticmethod
+    def implied_lambdas(p1: float, p2: float, p_over25: float | None = None) -> tuple[float, float]:
+        """Inverte o Poisson: total via Over2.5 (bisseccao), supremacia via P(1)-P(2)."""
+        def p_ge3(lt):
+            return 1 - math.exp(-lt) * (1 + lt + lt * lt / 2)
+        if p_over25 and 0.02 < p_over25 < 0.98:
+            lo, hi = 0.4, 6.0
+            for _ in range(50):
+                mid = (lo + hi) / 2
+                lo, hi = (mid, hi) if p_ge3(mid) < p_over25 else (lo, mid)
+            lt = (lo + hi) / 2
+        else:
+            lt = 2.6
+        e0 = MathEngine()
+        lim = min(2.4, lt - 0.1)
+        lo, hi = -lim, lim
+        for _ in range(50):
+            s = (lo + hi) / 2
+            lh, la = max(0.05, (lt + s) / 2), max(0.05, (lt - s) / 2)
+            pr = e0.market_probs(lh, la)
+            if (pr["home"] - pr["away"]) < (p1 - p2):
+                lo = s
+            else:
+                hi = s
+        s = (lo + hi) / 2
+        return round(max(0.05, (lt + s) / 2), 2), round(max(0.05, (lt - s) / 2), 2)
+
 
 class BiasCalibrator:
     """Le o historico liquidado e recalcula fatores por grupo de mercado.
@@ -285,9 +315,9 @@ class DataScraper:
                         "finished": st_ == "FINISHED", "url": ""})
         return out
 
-    def _espn(self, d: dt.date) -> list[dict]:
+    def _espn(self, d: dt.date, ligas: list[str] | None = None) -> list[dict]:
         jogos, vistos = [], set()
-        for lg in ESPN_LEAGUES:
+        for lg in ["all"] + list(ligas or ESPN_LEAGUES):
             try:
                 r = self.s.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard",
                                params={"dates": d.strftime("%Y%m%d")}, timeout=15)
@@ -314,9 +344,12 @@ class DataScraper:
                                   "finished": estado.get("state") == "post", "url": ""})
                 except Exception:
                     continue
+            if lg == "all" and jogos:
+                break
         return jogos
 
-    def fixtures_today(self, date: dt.date | None = None) -> tuple[list[dict], str]:
+    def fixtures_today(self, date: dt.date | None = None,
+                       ligas: list[str] | None = None) -> tuple[list[dict], str]:
         d = date or dt.date.today()
         key = os.getenv("FOOTBALL_DATA_KEY")
         if key:
@@ -326,7 +359,7 @@ class DataScraper:
                     return j, "football-data.org"
             except Exception:
                 pass
-        j = self._espn(d)
+        j = self._espn(d, ligas)
         if j:
             return j, "ESPN scoreboard"
         raise RuntimeError("nenhuma fonte de fixtures respondeu "
@@ -503,6 +536,75 @@ class OddsProvider:
                         keep("over25" if nm == "Over" else "under25", price)
         return best
 
+    # ---------- pre-jogo: consenso devigado + melhor preco ----------
+    def _sports(self) -> list[dict]:
+        if getattr(self, "_sports_cache", None) is None:
+            try:
+                r = self.s.get("https://api.the-odds-api.com/v4/sports/",
+                               params={"apiKey": self.key}, timeout=15)
+                r.raise_for_status()
+                self._sports_cache = [s for s in r.json()
+                                      if s.get("group") == "Soccer" and s.get("active")]
+            except Exception:
+                self._sports_cache = []
+        return self._sports_cache
+
+    def sport_key_for(self, liga: str):
+        sports = self._sports()
+        if not (sports and fuzzproc):
+            return None
+        hit = fuzzproc.extractOne(liga, [s["title"] for s in sports],
+                                  scorer=fuzz.token_set_ratio, score_cutoff=70)
+        return sports[hit[2]]["key"] if hit else None
+
+    def _league_events(self, sport_key: str) -> list:
+        cache = getattr(self, "_ev_cache", {})
+        if sport_key not in cache:
+            try:
+                r = self.s.get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", timeout=20,
+                               params={"apiKey": self.key, "regions": "eu",
+                                       "markets": "h2h,totals", "oddsFormat": "decimal"})
+                r.raise_for_status()
+                cache[sport_key] = r.json()
+            except Exception:
+                cache[sport_key] = []
+            self._ev_cache = cache
+        return cache[sport_key]
+
+    def prematch(self, liga: str, home: str, away: str) -> dict:
+        """{mercado: {'best': x, 'med': y}} para h2h e totais 2.5. {} sem key/sem match."""
+        if not (self.key and fuzzproc):
+            return {}
+        sk = self.sport_key_for(liga)
+        if not sk:
+            return {}
+        eventos = self._league_events(sk)
+        if not eventos:
+            return {}
+        nomes = [f'{e.get("home_team","")} vs {e.get("away_team","")}' for e in eventos]
+        hit = fuzzproc.extractOne(f"{home} vs {away}", nomes,
+                                  scorer=fuzz.token_set_ratio, score_cutoff=70)
+        if not hit:
+            return {}
+        alvo = eventos[hit[2]]
+        precos: dict[str, list] = {}
+        for bk in alvo.get("bookmakers", []):
+            for mk in bk.get("markets", []):
+                for out in mk.get("outcomes", []):
+                    nm, price = out.get("name", ""), out.get("price")
+                    if not price or price <= 1.0:
+                        continue
+                    k = None
+                    if mk["key"] == "h2h":
+                        k = ("home" if nm == alvo["home_team"] else
+                             "away" if nm == alvo["away_team"] else
+                             "draw" if nm == "Draw" else None)
+                    elif mk["key"] == "totals" and out.get("point") == 2.5:
+                        k = "over25" if nm == "Over" else "under25"
+                    if k:
+                        precos.setdefault(k, []).append(price)
+        return {k: {"best": max(v), "med": statistics.median(v)} for k, v in precos.items()}
+
 
 class Notifier:
     def __init__(self):
@@ -572,33 +674,83 @@ def setup_ui():
         data_sel = c1.date_input("Dia", dt.date.today(),
                                  help="Dia dos jogos a carregar. O pipeline pré-jogo corre uma vez "
                                       "por clique (não em loop) e guarda os λ em session_state.")
+        ligas_txt = c2.text_input("Ligas ESPN (fallback)", ",".join(ESPN_LEAGUES),
+                                  help="Códigos ESPN separados por vírgula (ex: uefa.champions, por.1, "
+                                       "bra.1). O scraper tenta primeiro o código 'all' (tudo do dia); "
+                                       "se a ESPN não o servir, itera esta lista. Acrescenta aqui "
+                                       "pré-eliminatórias/ligas que faltem.")
+        if "odds_provider" not in st.session_state:
+            st.session_state.odds_provider = OddsProvider(os.getenv("ODDS_API_KEY"),
+                                                          "soccer_fifa_world_cup")
+        oddsp: OddsProvider = st.session_state.odds_provider
         if c1.button("Correr pipeline do dia", type="primary") or "radar" not in st.session_state:
             try:
-                jogos, fonte_fix = scraper.fixtures_today(data_sel)
+                ligas = [x.strip() for x in ligas_txt.split(",") if x.strip()]
+                jogos, fonte_fix = scraper.fixtures_today(data_sel, ligas)
                 st.session_state.radar_fonte = fonte_fix
             except Exception as e:
                 st.error(f"Fixtures falharam: {e}")
                 jogos = []
             linhas = []
             for j in jogos:
-                pri = scraper.build_prior(j["home"], j["away"], j["liga"])
+                odds_pre = oddsp.prematch(j["liga"], j["home"], j["away"])
+                if all(k in odds_pre for k in ("home", "draw", "away")):
+                    inv = {k: 1.0 / odds_pre[k]["med"] for k in ("home", "draw", "away")}
+                    s = sum(inv.values())
+                    p1, p2 = inv["home"] / s, inv["away"] / s          # devig proporcional
+                    po = None
+                    if "over25" in odds_pre and "under25" in odds_pre:
+                        io, iu = 1.0 / odds_pre["over25"]["med"], 1.0 / odds_pre["under25"]["med"]
+                        po = io / (io + iu)
+                    lh, la = MathEngine.implied_lambdas(p1, p2, po)
+                    pri = {"lh": lh, "la": la, "fontes": "odds-implied"}
+                else:
+                    pri = scraper.build_prior(j["home"], j["away"], j["liga"])
                 p = engine.market_probs(pri["lh"], pri["la"])
+                melhor = None
+                for mk in ("home", "draw", "away", "over25", "under25"):
+                    o = odds_pre.get(mk, {}).get("best")
+                    if o and p[mk] > 1e-4:
+                        e_ = engine.ev(p[mk], o)
+                        if melhor is None or e_ > melhor[2]:
+                            melhor = (mk, o, e_)
                 linhas.append({**j, **pri,
                                "p_home": p["home"], "p_draw": p["draw"], "p_away": p["away"],
-                               "p_over25": p["over25"], "p_btts": p["btts_yes"]})
+                               "p_over25": p["over25"], "p_btts": p["btts_yes"],
+                               "ev_mk": melhor[0] if melhor else None,
+                               "ev_odd": melhor[1] if melhor else None,
+                               "ev_val": melhor[2] if melhor else None,
+                               "melhor_ev": (f"{MARKET_LABELS[melhor[0]]} @{melhor[1]:.2f} "
+                                             f"({melhor[2]*100:+.1f}%)") if melhor else "—"})
             st.session_state.radar = linhas
+            if not oddsp.key:
+                st.info("Sem ODDS_API_KEY: priors caem para Understat/baseline e não há coluna de EV. "
+                        "Chave grátis em the-odds-api.com transforma o Radar num screener de valor.")
         linhas = st.session_state.get("radar", [])
         if linhas:
             st.caption(f"Fixtures via {st.session_state.get('radar_fonte','?')} · {len(linhas)} jogos · "
                        "para live, cola o URL do jogo no FotMob na aba seguinte.")
             df = pd.DataFrame(linhas)
             vis = df[["liga", "home", "away", "hora_utc", "lh", "la",
-                      "p_home", "p_draw", "p_away", "p_over25", "p_btts", "fontes"]].copy()
+                      "p_home", "p_draw", "p_away", "p_over25", "p_btts",
+                      "melhor_ev", "fontes"]].copy()
             for col in ["p_home", "p_draw", "p_away", "p_over25", "p_btts"]:
                 vis[col] = (vis[col] * 100).round(1)
             vis.columns = ["Liga", "Casa", "Fora", "UTC", "λC", "λF",
-                           "P1 %", "PX %", "P2 %", "Over2.5 %", "BTTS %", "Fontes"]
+                           "P1 %", "PX %", "P2 %", "Over2.5 %", "BTTS %", "Melhor EV", "Fontes"]
             st.dataframe(vis, use_container_width=True, height=520)
+            vals = df[df.ev_val.notna() & (df.ev_val >= CFG["ev_min"])].sort_values(
+                "ev_val", ascending=False) if "ev_val" in df else pd.DataFrame()
+            st.subheader("🔥 Value pré-jogo (melhor preço vs consenso devigado)")
+            if not vals.empty:
+                vv = vals[["liga", "home", "away", "hora_utc", "melhor_ev", "lh", "la"]].copy()
+                vv.columns = ["Liga", "Casa", "Fora", "UTC", "Mercado / EV", "λC", "λF"]
+                st.dataframe(vv, use_container_width=True)
+                st.caption("EV = melhor preço entre casas vs probabilidade do consenso devigado "
+                           "(mediana). Sinal do tipo closing-line-value: uma casa atrasada face ao "
+                           "mercado. Confirma a odd antes de fechar — pré-jogo mexe ao minuto.")
+            else:
+                st.caption(f"Nenhum mercado com EV ≥ {CFG['ev_min']:.0%} nas odds recolhidas.")
             if c2.button("Guardar previsões na BD"):
                 db.save_predictions([{"data": str(data_sel), "match_id": l["match_id"],
                                       "jogo": f'{l["home"]} vs {l["away"]}', "liga": l["liga"],
