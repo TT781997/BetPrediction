@@ -501,8 +501,10 @@ class DataScraper:
 # ════════════════════════════════ ODDS & ALERTAS ════════════════════════════════
 
 class OddsProvider:
-    def __init__(self, api_key: str | None, sport: str, odds_file: str = "odds.json"):
+    def __init__(self, api_key: str | None, sport: str, odds_file: str = "odds.json",
+                 cache: dict | None = None):
         self.key, self.sport, self.file = api_key, sport, odds_file
+        self.cache = cache if cache is not None else {}
         self.s = requests.Session()
         self.s.headers.update(UA)
 
@@ -551,16 +553,16 @@ class OddsProvider:
 
     # ---------- pre-jogo: consenso devigado + melhor preco ----------
     def _sports(self) -> list[dict]:
-        if getattr(self, "_sports_cache", None) is None:
+        if self.cache.get("sports") is None:
             try:
                 r = self.s.get("https://api.the-odds-api.com/v4/sports/",
                                params={"apiKey": self.key}, timeout=15)
                 r.raise_for_status()
-                self._sports_cache = [s for s in r.json()
-                                      if s.get("group") == "Soccer" and s.get("active")]
+                self.cache["sports"] = [s for s in r.json()
+                                        if s.get("group") == "Soccer" and s.get("active")]
             except Exception:
-                self._sports_cache = []
-        return self._sports_cache
+                self.cache["sports"] = []
+        return self.cache["sports"]
 
     def sport_key_for(self, liga: str):
         sports = self._sports()
@@ -571,18 +573,17 @@ class OddsProvider:
         return sports[hit[2]]["key"] if hit else None
 
     def _league_events(self, sport_key: str) -> list:
-        cache = getattr(self, "_ev_cache", {})
-        if sport_key not in cache:
+        eventos = self.cache.setdefault("events", {})
+        if sport_key not in eventos:
             try:
                 r = self.s.get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", timeout=20,
                                params={"apiKey": self.key, "regions": "eu",
                                        "markets": "h2h,totals", "oddsFormat": "decimal"})
                 r.raise_for_status()
-                cache[sport_key] = r.json()
+                eventos[sport_key] = r.json()
             except Exception:
-                cache[sport_key] = []
-            self._ev_cache = cache
-        return cache[sport_key]
+                eventos[sport_key] = []
+        return eventos[sport_key]
 
     def prematch(self, liga: str, home: str, away: str) -> dict:
         """{mercado: {'best': x, 'med': y}} para h2h e totais 2.5. {} sem key/sem match."""
@@ -672,9 +673,7 @@ def setup_ui():
                "não certezas: joga só com dinheiro de entretenimento.")
 
     db = Database()
-    if "scraper" not in st.session_state:
-        st.session_state.scraper = DataScraper()
-    scraper: DataScraper = st.session_state.scraper
+    scraper = DataScraper()  # nunca guardar instâncias em session_state: sobrevivem a hot-reloads
     engine = MathEngine(calib=db.calibration())
 
     cfg_db = db.config_all()
@@ -708,6 +707,13 @@ def setup_ui():
 
     notifier = Notifier(k_tg_tok, k_tg_chat)
 
+    st.session_state.setdefault("odds_cache", {})
+    if st.session_state.get("odds_key") != k_odds:
+        st.session_state.odds_cache.clear()
+        st.session_state.odds_key = k_odds
+    oddsp = OddsProvider(k_odds.strip() or None, "soccer_fifa_world_cup",
+                         cache=st.session_state.odds_cache)
+
     tab_radar, tab_live, tab_alertas, tab_hist = st.tabs(
         ["📡 Radar Pré-Jogo", "🎯 Live Quant Desk", "🚨 Alertas EV+", "📚 Histórico & Auditoria"])
 
@@ -722,11 +728,6 @@ def setup_ui():
                                        "bra.1). O scraper tenta primeiro o código 'all' (tudo do dia); "
                                        "se a ESPN não o servir, itera esta lista. Acrescenta aqui "
                                        "pré-eliminatórias/ligas que faltem.")
-        if st.session_state.get("odds_key") != k_odds or "odds_provider" not in st.session_state:
-            st.session_state.odds_provider = OddsProvider(k_odds.strip() or None,
-                                                          "soccer_fifa_world_cup")
-            st.session_state.odds_key = k_odds
-        oddsp: OddsProvider = st.session_state.odds_provider
         if c1.button("Correr pipeline do dia", type="primary") or "radar" not in st.session_state:
             try:
                 ligas = [x.strip() for x in ligas_txt.split(",") if x.strip()]
@@ -890,8 +891,7 @@ def setup_ui():
                 st.progress(min(1.0, rev_w / kill_eff),
                             text=f"λ revelado {names[i]}: {rev_w:.3f} / morte {kill_eff:.2f} — {zona}")
 
-                odds = st.session_state.get("odds_provider",
-                                             OddsProvider(None, "soccer_fifa_world_cup")).get(names[0], names[1])
+                odds = oddsp.get(names[0], names[1])
                 rows, alertas = [], []
                 for mk, label in MARKET_LABELS.items():
                     p_ = probs[mk]
