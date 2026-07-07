@@ -6,6 +6,7 @@ Instalar e correr:
     pip install -r requirements.txt
     export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...   # opcional
     export ODDS_API_KEY=...                              # opcional (the-odds-api.com)
+    export FOOTBALL_DATA_KEY=...                         # opcional (football-data.org, grátis)
     streamlit run app.py
 
 Sem Telegram/OddsAPI configurados a app funciona na mesma: alertas ficam só na BD
@@ -40,6 +41,8 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Fi
       "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8"}
 
 FACT = [math.factorial(k) for k in range(CFG["nmax"] + 1)]
+
+ESPN_LEAGUES = ["fifa.world", "uefa.champions", "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "por.1"]
 
 MARKET_LABELS = {
     "home": "Vitória Casa", "draw": "Empate", "away": "Vitória Fora",
@@ -263,31 +266,71 @@ class DataScraper:
             for v in o:
                 yield from DataScraper.walk(v)
 
-    # ---------- FotMob: jogos do dia ----------
-    def fotmob_today(self, date: dt.date | None = None) -> list[dict]:
-        d = (date or dt.date.today()).strftime("%Y%m%d")
-        data = self._next_data(f"https://www.fotmob.com/pt-PT/matches?date={d}")
+    # ---------- Fixtures do dia (a lista do FotMob é hidratada no cliente via API
+    # assinada — não é server-rendered; usa-se football-data.org e/ou ESPN) ----------
+    def _football_data(self, d: dt.date, key: str) -> list[dict]:
+        r = self.s.get("https://api.football-data.org/v4/matches", timeout=20,
+                       headers={"X-Auth-Token": key},
+                       params={"dateFrom": d.isoformat(), "dateTo": d.isoformat()})
+        r.raise_for_status()
+        out = []
+        for m in r.json().get("matches", []):
+            st_ = m.get("status", "")
+            out.append({"match_id": str(m.get("id")),
+                        "liga": (m.get("competition") or {}).get("name", "?"),
+                        "home": (m.get("homeTeam") or {}).get("name", "?"),
+                        "away": (m.get("awayTeam") or {}).get("name", "?"),
+                        "hora_utc": str(m.get("utcDate", ""))[11:16],
+                        "started": st_ in ("IN_PLAY", "PAUSED", "FINISHED"),
+                        "finished": st_ == "FINISHED", "url": ""})
+        return out
+
+    def _espn(self, d: dt.date) -> list[dict]:
         jogos, vistos = [], set()
-        for node in self.walk(data):
-            liga = node.get("name") if isinstance(node.get("matches"), list) else None
-            for m in (node.get("matches") or []):
-                if not (isinstance(m, dict) and isinstance(m.get("home"), dict)
-                        and isinstance(m.get("away"), dict) and m.get("id")):
+        for lg in ESPN_LEAGUES:
+            try:
+                r = self.s.get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{lg}/scoreboard",
+                               params={"dates": d.strftime("%Y%m%d")}, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+            except Exception:
+                continue
+            liga = (data.get("leagues") or [{}])[0].get("name", lg)
+            for ev in data.get("events", []):
+                try:
+                    comp = ev["competitions"][0]
+                    casa = next(c for c in comp["competitors"] if c.get("homeAway") == "home")
+                    fora = next(c for c in comp["competitors"] if c.get("homeAway") == "away")
+                    estado = (ev.get("status") or {}).get("type", {}) or {}
+                    mid = str(ev.get("id"))
+                    if mid in vistos:
+                        continue
+                    vistos.add(mid)
+                    jogos.append({"match_id": mid, "liga": liga,
+                                  "home": casa["team"]["displayName"],
+                                  "away": fora["team"]["displayName"],
+                                  "hora_utc": str(ev.get("date", ""))[11:16],
+                                  "started": estado.get("state") in ("in", "post"),
+                                  "finished": estado.get("state") == "post", "url": ""})
+                except Exception:
                     continue
-                if m["id"] in vistos:
-                    continue
-                vistos.add(m["id"])
-                st_ = m.get("status", {}) or {}
-                page = m.get("pageUrl") or f"/pt-PT/match/{m['id']}"
-                jogos.append({
-                    "match_id": str(m["id"]),
-                    "liga": liga or str(m.get("leagueName", "?")),
-                    "home": m["home"].get("name", "?"), "away": m["away"].get("name", "?"),
-                    "hora_utc": str(st_.get("utcTime", ""))[11:16],
-                    "started": bool(st_.get("started")), "finished": bool(st_.get("finished")),
-                    "url": "https://www.fotmob.com" + page.split("#")[0],
-                })
         return jogos
+
+    def fixtures_today(self, date: dt.date | None = None) -> tuple[list[dict], str]:
+        d = date or dt.date.today()
+        key = os.getenv("FOOTBALL_DATA_KEY")
+        if key:
+            try:
+                j = self._football_data(d, key)
+                if j:
+                    return j, "football-data.org"
+            except Exception:
+                pass
+        j = self._espn(d)
+        if j:
+            return j, "ESPN scoreboard"
+        raise RuntimeError("nenhuma fonte de fixtures respondeu "
+                           "(define FOOTBALL_DATA_KEY — chave grátis — ou verifica a rede)")
 
     # ---------- FotMob: live ----------
     def fotmob_live(self, url: str):
@@ -529,9 +572,10 @@ def setup_ui():
         data_sel = c1.date_input("Dia", dt.date.today())
         if c1.button("Correr pipeline do dia", type="primary") or "radar" not in st.session_state:
             try:
-                jogos = scraper.fotmob_today(data_sel)
+                jogos, fonte_fix = scraper.fixtures_today(data_sel)
+                st.session_state.radar_fonte = fonte_fix
             except Exception as e:
-                st.error(f"FotMob fixtures falhou: {e}")
+                st.error(f"Fixtures falharam: {e}")
                 jogos = []
             linhas = []
             for j in jogos:
@@ -543,6 +587,8 @@ def setup_ui():
             st.session_state.radar = linhas
         linhas = st.session_state.get("radar", [])
         if linhas:
+            st.caption(f"Fixtures via {st.session_state.get('radar_fonte','?')} · {len(linhas)} jogos · "
+                       "para live, cola o URL do jogo no FotMob na aba seguinte.")
             df = pd.DataFrame(linhas)
             vis = df[["liga", "home", "away", "hora_utc", "lh", "la",
                       "p_home", "p_draw", "p_away", "p_over25", "p_btts", "fontes"]].copy()
@@ -569,7 +615,10 @@ def setup_ui():
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         escolha = c1.selectbox("Jogo", ["— URL manual —"] + list(opcoes))
         jogo_sel = opcoes.get(escolha)
-        url = c1.text_input("URL FotMob", jogo_sel["url"] if jogo_sel else "")
+        url = c1.text_input("URL FotMob", jogo_sel["url"] if jogo_sel else "",
+                            help="Cola o link da página do JOGO no FotMob — essas páginas são "
+                                 "server-rendered; a lista do dia não é, por isso vem do "
+                                 "football-data/ESPN sem URL.")
         lh0 = jogo_sel["lh"] if jogo_sel else CFG["baseline"]["home"]
         la0 = jogo_sel["la"] if jogo_sel else CFG["baseline"]["away"]
         prior_h = c2.number_input("λ casa (prior)", 0.1, 5.0, float(lh0), 0.05)
