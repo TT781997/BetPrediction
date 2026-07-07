@@ -569,7 +569,9 @@ def setup_ui():
     # ---------- TAB 1: RADAR ----------
     with tab_radar:
         c1, c2 = st.columns([1, 3])
-        data_sel = c1.date_input("Dia", dt.date.today())
+        data_sel = c1.date_input("Dia", dt.date.today(),
+                                 help="Dia dos jogos a carregar. O pipeline pré-jogo corre uma vez "
+                                      "por clique (não em loop) e guarda os λ em session_state.")
         if c1.button("Correr pipeline do dia", type="primary") or "radar" not in st.session_state:
             try:
                 jogos, fonte_fix = scraper.fixtures_today(data_sel)
@@ -613,7 +615,9 @@ def setup_ui():
         linhas = st.session_state.get("radar", [])
         opcoes = {f'{l["home"]} vs {l["away"]} ({l["liga"]})': l for l in linhas}
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        escolha = c1.selectbox("Jogo", ["— URL manual —"] + list(opcoes))
+        escolha = c1.selectbox("Jogo", ["— URL manual —"] + list(opcoes),
+                               help="Escolhe um jogo do Radar para pré-carregar os λ calculados; "
+                                    "'— URL manual —' deixa-te preencher tudo à mão.")
         jogo_sel = opcoes.get(escolha)
         url = c1.text_input("URL FotMob", jogo_sel["url"] if jogo_sel else "",
                             help="Cola o link da página do JOGO no FotMob — essas páginas são "
@@ -621,16 +625,41 @@ def setup_ui():
                                  "football-data/ESPN sem URL.")
         lh0 = jogo_sel["lh"] if jogo_sel else CFG["baseline"]["home"]
         la0 = jogo_sel["la"] if jogo_sel else CFG["baseline"]["away"]
-        prior_h = c2.number_input("λ casa (prior)", 0.1, 5.0, float(lh0), 0.05)
-        prior_a = c2.number_input("λ fora (prior)", 0.1, 5.0, float(la0), 0.05)
-        pet = c3.number_input("p(casa) prolong.", 0.0, 1.0, CFG["pet"], 0.01)
-        w = c3.number_input("Peso do prior W", 10.0, 180.0, CFG["w"], 5.0)
-        side = c4.selectbox("Equipa vigiada", ["fora", "casa"])
+        prior_h = c2.number_input("λ casa (prior)", 0.1, 5.0, float(lh0), 0.05,
+                                  help="Golos esperados da equipa da casa nos 90', estimados ANTES do "
+                                       "jogo. É o prior bayesiano — o input central do modelo. O Radar "
+                                       "sugere um valor, mas ajusta-o com o que o pipeline não vê: "
+                                       "lesões, onze inicial, motivação.")
+        prior_a = c2.number_input("λ fora (prior)", 0.1, 5.0, float(la0), 0.05,
+                                  help="Igual ao λ casa, para a equipa de fora. Modelo é tão bom "
+                                       "quanto estes dois números: lixo à entrada, EV+ fantasma à saída.")
+        pet = c3.number_input("p(casa) prolong.", 0.0, 1.0, CFG["pet"], 0.01,
+                              help="Probabilidade de a CASA se apurar se o jogo for a prolongamento/"
+                                   "penáltis. O Poisson só modela até aos 90'; isto fecha a conta dos "
+                                   "mercados 'qualifica-se'. 0.50 = moeda ao ar.")
+        w = c3.number_input("Peso do prior W", 10.0, 180.0, CFG["w"], 5.0,
+                            help="Quantos 'minutos de evidência' vale o teu prior na atualização "
+                                 "bayesiana: λ_rev = (W·prior + 90·xG)/(W+min). Com W=90, aos 45' o "
+                                 "live pesa 1/3. Baixa para reagir mais depressa ao xG; sobe para "
+                                 "ignorar ruído de início de jogo.")
+        side = c4.selectbox("Equipa vigiada", ["fora", "casa"],
+                            help="A equipa cujo λ revelado é comparado com a linha de morte — "
+                                 "normalmente a que ameaça a tua tese (apostaste 'casa vence a zero' "
+                                 "→ vigia a fora).")
         kill = c4.number_input("Linha de morte λ*", 0.0, 5.0, 0.0, 0.05,
-                               help="0 = prior vigiado + 0.10")
-        ev_min = c5.number_input("EV mínimo", 0.01, 0.30, CFG["ev_min"], 0.01)
-        monitor = c6.toggle("Monitorizar (60 s)", value=False)
-        enviar_tg = c6.toggle("Enviar Telegram", value=bool(notifier.token))
+                               help="λ revelado a partir do qual consideras a tese morta e ponderas "
+                                    "hedge/cash-out. É a tua regra de saída definida a frio, antes do "
+                                    "jogo. 0 = automático (prior da vigiada + 0.10).")
+        ev_min = c5.number_input("EV mínimo", 0.01, 0.30, CFG["ev_min"], 0.01,
+                                 help="Margem mínima (prob.×odd − 1) para registar alerta na BD e "
+                                      "enviar Telegram. 0.05 = gatilho de 5%. Sobe para menos ruído; "
+                                      "lembra-te que o erro do modelo é muitas vezes maior que 5%.")
+        monitor = c6.toggle("Monitorizar (60 s)", value=False,
+                            help="Liga o autorefresh de 60 s (streamlit-autorefresh) enquanto o jogo "
+                                 "decorre. Desliga no fim para poupar pedidos ao FotMob.")
+        enviar_tg = c6.toggle("Enviar Telegram", value=bool(notifier.token),
+                              help="Envia cada alerta EV+ para o bot definido em TELEGRAM_BOT_TOKEN/"
+                                   "TELEGRAM_CHAT_ID. Sem env vars, fica só o registo na BD.")
 
         if monitor and st_autorefresh:
             st_autorefresh(interval=60_000, key="live_tick")
@@ -709,7 +738,10 @@ def setup_ui():
     # ---------- TAB 3: ALERTAS ----------
     with tab_alertas:
         df = db.alerts_df()
-        st.dataframe(df, use_container_width=True, height=560) if not df.empty else st.info("Sem alertas registados.")
+        if df.empty:
+            st.info("Sem alertas registados.")
+        else:
+            st.dataframe(df, use_container_width=True, height=560)
 
     # ---------- TAB 4: HISTÓRICO ----------
     with tab_hist:
