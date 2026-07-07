@@ -314,10 +314,13 @@ class DataScraper:
     def _football_data(self, d: dt.date, key: str) -> list[dict]:
         r = self.s.get("https://api.football-data.org/v4/matches", timeout=20,
                        headers={"X-Auth-Token": key},
-                       params={"dateFrom": d.isoformat(), "dateTo": d.isoformat()})
+                       params={"dateFrom": d.isoformat(),
+                               "dateTo": (d + dt.timedelta(days=1)).isoformat()})
         r.raise_for_status()
         out = []
         for m in r.json().get("matches", []):
+            if not str(m.get("utcDate", "")).startswith(d.isoformat()):
+                continue
             st_ = m.get("status", "")
             out.append({"match_id": str(m.get("id")),
                         "liga": (m.get("competition") or {}).get("name", "?"),
@@ -361,22 +364,42 @@ class DataScraper:
                 break
         return jogos
 
+    @staticmethod
+    def _mesmo_jogo(a: dict, b: dict) -> bool:
+        if a["hora_utc"] != b["hora_utc"] or not fuzzproc:
+            return False
+        if fuzz.token_set_ratio(a["liga"], b["liga"]) < 70:
+            return False
+        return max(fuzz.token_set_ratio(a["home"], b["home"]),
+                   fuzz.token_set_ratio(a["away"], b["away"])) >= 88
+
     def fixtures_today(self, date: dt.date | None = None, ligas: list[str] | None = None,
                        fd_key: str | None = None) -> tuple[list[dict], str]:
+        """Funde football-data.org (oficial, ~12 competições no free tier) com a ESPN
+        (cobertura larga) e dedupica — nenhuma fonte curto-circuita a outra."""
         d = date or dt.date.today()
         key = (fd_key or "").strip() or os.getenv("FOOTBALL_DATA_KEY")
+        fontes, jogos = [], []
         if key:
             try:
-                j = self._football_data(d, key)
-                if j:
-                    return j, "football-data.org"
+                jogos = self._football_data(d, key)
+                if jogos:
+                    fontes.append(f"football-data.org ({len(jogos)})")
             except Exception:
                 pass
-        j = self._espn(d, ligas)
-        if j:
-            return j, "ESPN scoreboard"
-        raise RuntimeError("nenhuma fonte de fixtures respondeu "
-                           "(define FOOTBALL_DATA_KEY — chave grátis — ou verifica a rede)")
+        try:
+            extra = self._espn(d, ligas)
+        except Exception:
+            extra = []
+        novos = [j for j in extra if not any(self._mesmo_jogo(j, x) for x in jogos)]
+        if novos:
+            fontes.append(f"ESPN ({len(novos)})")
+        jogos += novos
+        if not jogos:
+            raise RuntimeError("nenhuma fonte de fixtures respondeu "
+                               "(verifica FOOTBALL_DATA_KEY, a lista de ligas ESPN e a rede)")
+        jogos.sort(key=lambda j: (j.get("hora_utc") or "99:99"))
+        return jogos, " + ".join(fontes)
 
     # ---------- FotMob: live ----------
     def fotmob_live(self, url: str):
@@ -775,7 +798,10 @@ def setup_ui():
         if linhas:
             st.caption(f"Fixtures via {st.session_state.get('radar_fonte','?')} · {len(linhas)} jogos · "
                        "para live, cola o URL do jogo no FotMob na aba seguinte.")
+            ocultar = st.checkbox("Ocultar jogos já terminados", value=True)
             df = pd.DataFrame(linhas)
+            if ocultar and "finished" in df.columns:
+                df = df[~df["finished"].fillna(False)]
             vis = df[["liga", "home", "away", "hora_utc", "lh", "la",
                       "p_home", "p_draw", "p_away", "p_over25", "p_btts",
                       "melhor_ev", "fontes"]].copy()
@@ -783,7 +809,32 @@ def setup_ui():
                 vis[col] = (vis[col] * 100).round(1)
             vis.columns = ["Liga", "Casa", "Fora", "UTC", "λC", "λF",
                            "P1 %", "PX %", "P2 %", "Over2.5 %", "BTTS %", "Melhor EV", "Fontes"]
-            st.dataframe(vis, use_container_width=True, height=520)
+            cc = {
+                "UTC": st.column_config.TextColumn("UTC", help="Hora de início em UTC "
+                    "(Lisboa = UTC+1 no verão, Alemanha = UTC+2)."),
+                "λC": st.column_config.NumberColumn("λC", help="Golos esperados da equipa da CASA "
+                    "nos 90' (prior do modelo). Ver coluna Fontes para a origem."),
+                "λF": st.column_config.NumberColumn("λF", help="Golos esperados da equipa de FORA "
+                    "nos 90' (prior do modelo)."),
+                "P1 %": st.column_config.NumberColumn("P1 %", help="Probabilidade de vitória da casa "
+                    "aos 90', via Poisson com os λ desta linha."),
+                "PX %": st.column_config.NumberColumn("PX %", help="Probabilidade de empate aos 90'."),
+                "P2 %": st.column_config.NumberColumn("P2 %", help="Probabilidade de vitória de fora "
+                    "aos 90'."),
+                "Over2.5 %": st.column_config.NumberColumn("Over2.5 %", help="Probabilidade de 3 ou "
+                    "mais golos no jogo."),
+                "BTTS %": st.column_config.NumberColumn("BTTS %", help="Probabilidade de ambas as "
+                    "equipas marcarem."),
+                "Melhor EV": st.column_config.TextColumn("Melhor EV", help="Mercado com maior valor: "
+                    "MELHOR preço entre casas vs probabilidade do CONSENSO devigado (mediana). "
+                    "EV positivo = há uma casa atrasada face ao mercado (sinal tipo closing-line-"
+                    "value), não 'o modelo bate o mercado'."),
+                "Fontes": st.column_config.TextColumn("Fontes", help="Origem dos λ: odds-implied = "
+                    "invertidos do consenso de odds (o melhor); understat = xG recente (clubes big-5 "
+                    "em época); baseline = média genérica — pouco informativo, ajusta à mão na aba "
+                    "Live."),
+            }
+            st.dataframe(vis, use_container_width=True, height=520, column_config=cc)
             vals = df[df.ev_val.notna() & (df.ev_val >= CFG["ev_min"])].sort_values(
                 "ev_val", ascending=False) if "ev_val" in df else pd.DataFrame()
             st.subheader("🔥 Value pré-jogo (melhor preço vs consenso devigado)")
