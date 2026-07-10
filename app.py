@@ -29,6 +29,12 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
+    import asyncio
+    import httpx
+except ImportError:
+    httpx = None
+
+try:
     from rapidfuzz import fuzz, process as fuzzproc   # fork mantido do fuzzywuzzy (MIT, mais rápido)
 except ImportError:
     fuzz = fuzzproc = None
@@ -43,6 +49,40 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Fi
       "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8"}
 
 FACT = [math.factorial(k) for k in range(CFG["nmax"] + 1)]
+
+NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NIM_DEFAULTS = {
+    "agente1": "mistralai/mistral-large-2-instruct",
+    "agente2": "cohere/command-r-plus-08-2024",
+    "agente3": "qwen/qwen2-72b-instruct",
+    "agente4": "nvidia/nemotron-4-340b-instruct",
+    "agente5": "meta/llama-3.1-405b-instruct",
+}
+
+CALIB_ATIVA_DEFAULT = """1) +0.20 lambda/equipa em pre-eliminatorias de julho; Under em Q1 so com odd >= fair x1.10.
+2) Premio clean-sheet (+10% P CS) so para equipas em ritmo competitivo (epoca/torneio a decorrer).
+3) Choque-de-mercado: desvio >= 6 p.p. modelo-mercado -> mover 50% em direcao ao mercado.
+4) -15% xG bruto em knockout apenas se o adversario nao for defesa erratica (>=1 erro-que-gera-remate/jogo anula o corte)."""
+
+
+def montar_dossier(nome, liga, hora, lam, fontes_lam, odds_pre, notas, calib):
+    linhas = [f"JOGO: {nome} | COMPETIÇÃO: {liga} | HORA UTC: {hora}", ""]
+    if lam:
+        linhas.append(f"λ IMPLÍCITOS DO MERCADO (Poisson invertido do consenso devigado): "
+                      f"casa {lam[0]} | fora {lam[1]} (origem: {fontes_lam})")
+    if odds_pre:
+        linhas.append("ODDS AGREGADAS (the-odds-api; melhor/mediana): " +
+                      "; ".join(f"{k} {v['best']:.2f}/{v['med']:.2f}" for k, v in odds_pre.items()))
+    else:
+        linhas.append("ODDS AGREGADAS: indisponíveis nesta execução.")
+    faltam = "FootyStats, TotalCorner, Betdiary, Forebet, KickForm, xGscore"
+    if "understat" not in (fontes_lam or ""):
+        faltam += ", Understat"
+    linhas.append(f"FONTES INDISPONÍVEIS NESTA EXECUÇÃO (tratar como lacuna; usar média da liga): {faltam}")
+    linhas.append(f"NOTAS DO UTILIZADOR (lesões/onzes/contexto): {(notas or '').strip() or 'nenhumas'}")
+    linhas.append(f"CALIBRAÇÃO ATIVA (obrigatória na modelação): {(calib or '').strip()}")
+    return "\n".join(linhas)
+
 
 ESPN_LEAGUES = ["fifa.world", "uefa.champions", "uefa.europa", "uefa.europa.conf",
                 "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "por.1", "ned.1", "tur.1",
@@ -81,6 +121,10 @@ class Database:
                 grupo TEXT PRIMARY KEY, fator REAL, n INTEGER, atualizado TEXT);
             CREATE TABLE IF NOT EXISTS config(
                 chave TEXT PRIMARY KEY, valor TEXT);
+            CREATE TABLE IF NOT EXISTS agent_predictions(
+                id INTEGER PRIMARY KEY, data TEXT, jogo TEXT, odds_pt TEXT,
+                fair_json TEXT, ev_json TEXT, sintese TEXT,
+                resultado_real TEXT, settled INTEGER DEFAULT 0, criado TEXT);
             """)
 
     def _c(self):
@@ -121,6 +165,23 @@ class Database:
     def calibration(self) -> dict:
         with self._c() as c:
             return {g: f for g, f, *_ in c.execute("SELECT grupo,fator,n FROM calibration")}
+
+    def save_agent_pred(self, jogo: str, odds_pt: str, fair_json: str, ev_json: str, sintese: str):
+        with self._c() as c:
+            c.execute("INSERT INTO agent_predictions(data,jogo,odds_pt,fair_json,ev_json,sintese,"
+                      "settled,criado) VALUES(?,?,?,?,?,?,0,?)",
+                      (str(dt.date.today()), jogo, odds_pt, fair_json, ev_json, sintese,
+                       dt.datetime.now().isoformat()))
+
+    def agent_preds_abertas(self) -> list[tuple]:
+        with self._c() as c:
+            return c.execute("SELECT id, data, jogo, sintese FROM agent_predictions "
+                             "WHERE settled=0 ORDER BY id DESC LIMIT 10").fetchall()
+
+    def settle_agent_pred(self, pid: int, resultado: str):
+        with self._c() as c:
+            c.execute("UPDATE agent_predictions SET resultado_real=?, settled=1 WHERE id=?",
+                      (resultado, pid))
 
     def config_all(self) -> dict:
         with self._c() as c:
@@ -670,6 +731,141 @@ class OddsProvider:
         return {k: {"best": max(v), "med": statistics.median(v)} for k, v in precos.items()}
 
 
+SUFIXO_ANTI_ALUCINACAO = ("\n\nREGRA DURA: se uma fonte não constar do DOSSIER fornecido, "
+                          "declara-a como INDISPONÍVEL e nunca inventes números para ela.")
+
+AGENT_SYSTEMS = {
+    "agente1": """Atua como Analista de Dados Desportivos de Elite, 100% objetivo.
+Processa soccerdata/FotMob/FootyStats/Understat: xG/xGA/xPTS (5 jogos), PPDA, passes progressivos, set-pieces, xG tempo real, BTTS, Cantos, conversion rate elite.
+Declara lacunas explicitamente e usa média da liga.
+Saída OBRIGATÓRIA:
+## Métricas Processadas
+- lista bullet
+## Lacunas de Dados
+## Resumo Frio (3 frases máx.)
+Não prevejas.""",
+    "agente2": """Atua como Analista Tático de Elite, 100% frio. Cruza Agente 1 com FotMob (line-ups/lesões), TotalCorner (momentum), relatórios jogadores. Avalia impacto tático real, motivação e ameaças (set-pieces/contra-ataque).
+Saída OBRIGATÓRIA:
+## Impacto Tático
+## Fatores Decisivos
+Ignora hype.""",
+    "agente3": """Estatístico Matemático. Modela Poisson + Elo (Forebet/KickForm).
+OBRIGATÓRIO aplicar calibrações:
+- Knockout: +25% finishing elite, -15% xG bruto
+- Variância: +20% se |xG diff| <1.0
+- Cartões: +15% variância Poisson
+- Over bias se xG total >2.8-3.0 + ameaças
+- Baseline knockout: +0.15-0.25 xG/equipa
+Calcula Fair Odds ajustadas.
+Saída OBRIGATÓRIA:
+## Probabilidades Reais (Fair Odds)
+1: % | X: % | 2: %
+Over 2.5: % | Under: %
+## Calibrações Aplicadas
+No FIM, inclui SEMPRE um bloco de código json exatamente neste formato:
+```json
+{"p1": 0.00, "px": 0.00, "p2": 0.00, "over25": 0.00}
+```""",
+    "agente4": """Gestor de Risco. Cruza Fair Odds com Betdiary (dropping >10%), xGscore, consenso (validação). Deteta EV+ ou "No Bet".
+Saída OBRIGATÓRIA:
+## Comparação Odds
+## Value Bets / EV+
+## Decisão Final""",
+    "agente5": """Juiz Principal com auto-correção rigorosa.
+FASE 0 OBRIGATÓRIA (template exato):
+- Jogo: [ ] | Real: [ ] | Previsão anterior: [ ]
+- Diagnóstico Técnico: [ ]
+- Lição + Ajuste Quantitativo: [ ]
+Resumo Calibração Ativa no fim.
+Depois SÍNTESE FINAL com relatórios 1-4 + Fase 0.
+Saída OBRIGATÓRIA:
+## FASE 0 - Auditoria
+[template + resumo calibração]
+## SÍNTESE FINAL
+Previsão: ... | EV+: % | Aposta: [ ] ou "No Bet" | Confiança: N/10 | Justificativa: [2 frases]
+NOTA: a secção VERIFICAÇÃO DETERMINÍSTICA do prompt foi calculada em Python e prevalece sobre qualquer EV que os relatórios afirmem.""",
+}
+
+
+class AgentCouncil:
+    """Agentes 1-4 em paralelo (NVIDIA NIM) -> verificação determinística de EV -> Agente 5."""
+
+    def __init__(self, api_key: str, modelos: dict):
+        self.key = (api_key or "").strip()
+        self.modelos = modelos
+
+    async def _um(self, client, modelo: str, system: str, user: str) -> str:
+        r = await client.post(NIM_URL, json={
+            "model": modelo, "temperature": 0.25, "max_tokens": 800,
+            "messages": [{"role": "system", "content": system + SUFIXO_ANTI_ALUCINACAO},
+                         {"role": "user", "content": user}]})
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+
+    async def _paralelo(self, dossier: str) -> list[str]:
+        async with httpx.AsyncClient(timeout=90,
+                                     headers={"Authorization": f"Bearer {self.key}"}) as c:
+            tarefas = [self._um(c, self.modelos[f"agente{i}"], AGENT_SYSTEMS[f"agente{i}"], dossier)
+                       for i in range(1, 5)]
+            res = await asyncio.gather(*tarefas, return_exceptions=True)
+        return [r if isinstance(r, str) else f"AGENTE {i+1} INDISPONÍVEL: {r}"
+                for i, r in enumerate(res)]
+
+    @staticmethod
+    def extrair_probs(texto_agente3: str) -> dict | None:
+        m = re.search(r'\{[^{}]*"p1"[\s\S]*?\}', texto_agente3)
+        if not m:
+            return None
+        try:
+            d = json.loads(m.group(0))
+            p = {k: float(d[k]) for k in ("p1", "px", "p2", "over25")}
+            if p["p1"] > 1:  # veio em percentagem
+                p = {k: v / 100 for k, v in p.items()}
+            s = p["p1"] + p["px"] + p["p2"]
+            if not 0.9 < s < 1.1:
+                return None
+            for k in ("p1", "px", "p2"):
+                p[k] /= s
+            return p
+        except Exception:
+            return None
+
+    @staticmethod
+    def verificacao_ev(probs: dict | None, odds: dict) -> tuple[str, dict]:
+        if not probs:
+            return ("Agente 3 não devolveu JSON válido — EV NÃO verificável; "
+                    "por regra, sem verificação = No Bet."), {}
+        pares = [("1", probs["p1"], odds.get("h")), ("X", probs["px"], odds.get("d")),
+                 ("2", probs["p2"], odds.get("a")), ("Over 2.5", probs["over25"], odds.get("o25")),
+                 ("Under 2.5", 1 - probs["over25"], odds.get("u25"))]
+        linhas, evj = [], {}
+        for lab, p, odd in pares:
+            if odd and odd > 1 and p > 1e-4:
+                ev = p * odd - 1
+                evj[lab] = round(ev, 4)
+                linhas.append(f"{lab}: fair {1/p:.2f} vs mercado {odd:.2f} -> EV {ev*100:+.1f}%"
+                              + ("  [EV+]" if ev >= 0.05 else ""))
+        txt = ("=== VERIFICAÇÃO DETERMINÍSTICA (Python; prevalece sobre os relatórios) ===\n"
+               + "\n".join(linhas)
+               + "\nRegra: EV+ exige mercado > fair (p*odd-1 >= +5%).")
+        return txt, evj
+
+    def julgar(self, data_hoje: str, fase0: str, jogo: str, odds_txt: str,
+               rels: list[str], verif: str) -> str:
+        user = (f"DATA: {data_hoje}\n=== FASE 0 (ONTEM) ===\n{fase0 or 'Sem previsões anteriores registadas.'}\n"
+                f"=== JOGO HOJE ===\nJogo: {jogo} | Odds PT: {odds_txt}\n"
+                + "".join(f"\n--- RELATÓRIO {i+1} ---\n{r}\n" for i, r in enumerate(rels))
+                + f"\n{verif}\n\nExecuta FASE 0 (template) + SÍNTESE FINAL (formato acima).")
+        async def _run():
+            async with httpx.AsyncClient(timeout=120,
+                                         headers={"Authorization": f"Bearer {self.key}"}) as c:
+                return await self._um(c, self.modelos["agente5"], AGENT_SYSTEMS["agente5"], user)
+        return asyncio.run(_run())
+
+    def correr_analistas(self, dossier: str) -> list[str]:
+        return asyncio.run(self._paralelo(dossier))
+
+
 class Notifier:
     def __init__(self, token: str | None = None, chat: str | None = None):
         self.token = (token or "").strip() or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -740,13 +936,16 @@ def setup_ui():
         k_tg_tok = st.text_input("TELEGRAM_BOT_TOKEN", type="password",
                                  value=os.getenv("TELEGRAM_BOT_TOKEN", "") or cfg_db.get("tg_token", ""),
                                  help="Token do bot (@BotFather).")
+        k_nim = st.text_input("NVIDIA_API_KEY", type="password",
+                              value=os.getenv("NVIDIA_API_KEY", "") or cfg_db.get("nvidia_key", ""),
+                              help="build.nvidia.com — alimenta o Conselho de Agentes (aba 🤖).")
         k_tg_chat = st.text_input("TELEGRAM_CHAT_ID",
                                   value=os.getenv("TELEGRAM_CHAT_ID", "") or cfg_db.get("tg_chat", ""),
                                   help="ID do chat/canal que recebe os alertas.")
         cb1, cb2 = st.columns(2)
         if cb1.button("Guardar chaves"):
             db.set_config({"odds_api_key": k_odds, "football_data_key": k_fd,
-                           "tg_token": k_tg_tok, "tg_chat": k_tg_chat})
+                           "tg_token": k_tg_tok, "tg_chat": k_tg_chat, "nvidia_key": k_nim})
             st.success("Guardadas.")
         if cb2.button("Testar Telegram"):
             ok = Notifier(k_tg_tok, k_tg_chat).send("✅ Quant Desk ligado.")
@@ -764,8 +963,9 @@ def setup_ui():
     oddsp = OddsProvider(k_odds.strip() or None, "soccer_fifa_world_cup",
                          cache=st.session_state.odds_cache)
 
-    tab_radar, tab_live, tab_alertas, tab_hist = st.tabs(
-        ["📡 Radar Pré-Jogo", "🎯 Live Quant Desk", "🚨 Alertas EV+", "📚 Histórico & Auditoria"])
+    tab_radar, tab_live, tab_alertas, tab_hist, tab_conselho = st.tabs(
+        ["📡 Radar Pré-Jogo", "🎯 Live Quant Desk", "🚨 Alertas EV+", "📚 Histórico & Auditoria",
+         "🤖 Conselho de Agentes"])
 
     # ---------- TAB 1: RADAR ----------
     with tab_radar:
@@ -1072,6 +1272,117 @@ def setup_ui():
         cal = db.calibration()
         st.caption("Fatores de calibração ativos (frequência real / prob. média do modelo, "
                    f"clamp ±15%, n ≥ {CFG['calib_min_n']}): " + (str(cal) if cal else "nenhum — histórico curto."))
+
+    # ---------- TAB 5: CONSELHO DE AGENTES ----------
+    with tab_conselho:
+        if httpx is None:
+            st.error("Instala httpx (`pip install httpx`) e recarrega.")
+        elif not k_nim.strip():
+            st.info("Cola a NVIDIA_API_KEY na barra lateral (build.nvidia.com) para ativar o conselho.")
+        else:
+            st.caption("Pipeline: Agentes 1-4 em paralelo (NIM) → verificação determinística de EV "
+                       "em Python → Agente 5 (juiz) com FASE 0. O EV calculado prevalece sempre "
+                       "sobre o que os modelos afirmarem.")
+            with st.expander("Modelos NIM (editáveis — o catálogo muda de nomes)"):
+                modelos = {}
+                for i in range(1, 6):
+                    modelos[f"agente{i}"] = st.text_input(
+                        f"Agente {i}", cfg_db.get(f"nim_agente{i}", NIM_DEFAULTS[f"agente{i}"]),
+                        key=f"nim_m{i}")
+                cA, cB = st.columns(2)
+                if cA.button("Guardar modelos"):
+                    db.set_config({f"nim_agente{i}": modelos[f"agente{i}"] for i in range(1, 6)})
+                    st.success("Modelos guardados.")
+                if cB.button("Testar ligação NIM"):
+                    try:
+                        c5 = AgentCouncil(k_nim, modelos)
+                        async def _ping():
+                            async with httpx.AsyncClient(timeout=30,
+                                    headers={"Authorization": f"Bearer {c5.key}"}) as cli:
+                                return await c5._um(cli, modelos["agente5"], "Responde só: ok", "ping")
+                        st.success("NIM OK: " + asyncio.run(_ping())[:40])
+                    except Exception as e:
+                        st.error(f"Falhou: {e}")
+
+            st.subheader("FASE 0 — previsões por liquidar")
+            abertas = db.agent_preds_abertas()
+            fase0_partes = []
+            if not abertas:
+                st.caption("Sem previsões anteriores registadas.")
+            for pid, pdata, pjogo, psint in abertas:
+                cJ, cR, cL = st.columns([3, 2, 1])
+                cJ.write(f"**{pjogo}** ({pdata})")
+                res = cR.text_input("Resultado real (ex: 2-1)", key=f"res_{pid}",
+                                    label_visibility="collapsed", placeholder="Resultado real ex: 2-1")
+                if res.strip():
+                    resumo = (psint or "").split("SÍNTESE FINAL")[-1].strip()[:400]
+                    fase0_partes.append(f"- Jogo: {pjogo} | Real: {res.strip()} | "
+                                        f"Previsão anterior: {resumo}")
+                if cL.button("Liquidar", key=f"liq_{pid}") and res.strip():
+                    db.settle_agent_pred(pid, res.strip())
+                    st.rerun()
+            fase0_txt = "\n".join(fase0_partes)
+
+            st.subheader("Jogo de hoje")
+            linhas_r = st.session_state.get("radar", [])
+            ops = {f'{l["home"]} vs {l["away"]} ({l["liga"]})': l for l in linhas_r}
+            c1, c2 = st.columns([2, 3])
+            esc = c1.selectbox("Do Radar", ["— manual —"] + list(ops), key="cons_sel")
+            jsel = ops.get(esc)
+            jogo_nome = c1.text_input("Jogo", jsel and f'{jsel["home"]} vs {jsel["away"]}' or "",
+                                      key="cons_jogo")
+            o1, o2, o3, o4, o5 = st.columns(5)
+            oh = o1.number_input("Odd 1 (PT)", 1.0, 100.0, 1.0, 0.01, key="c_oh")
+            od = o2.number_input("Odd X", 1.0, 100.0, 1.0, 0.01, key="c_od")
+            oa = o3.number_input("Odd 2", 1.0, 100.0, 1.0, 0.01, key="c_oa")
+            oo = o4.number_input("Over 2.5", 1.0, 100.0, 1.0, 0.01, key="c_oo")
+            ou = o5.number_input("Under 2.5", 1.0, 100.0, 1.0, 0.01, key="c_ou")
+            notas = st.text_area("Notas (lesões, onzes, contexto — cola aqui o que vires no FotMob)",
+                                 height=90, key="cons_notas")
+            calib_txt = st.text_area("Calibração ativa (editável; vai no dossier e para o juiz)",
+                                     cfg_db.get("calib_ativa", CALIB_ATIVA_DEFAULT), height=110,
+                                     key="cons_calib")
+
+            if st.button("Correr Conselho (1-4 → verificação → Juiz)", type="primary",
+                         disabled=not jogo_nome.strip()):
+                try:
+                    lam = (jsel["lh"], jsel["la"]) if jsel else None
+                    odds_pre = (oddsp.prematch(jsel["liga"], jsel["home"], jsel["away"])
+                                if (jsel and oddsp.key) else {})
+                    dossier = montar_dossier(jogo_nome, jsel["liga"] if jsel else "?",
+                                             jsel["hora_utc"] if jsel else "?", lam,
+                                             jsel["fontes"] if jsel else "", odds_pre,
+                                             notas, calib_txt)
+                    db.set_config({"calib_ativa": calib_txt})
+                    conselho = AgentCouncil(k_nim, modelos)
+                    with st.spinner("Agentes 1-4 em paralelo…"):
+                        rels = conselho.correr_analistas(dossier)
+                    probs = AgentCouncil.extrair_probs(rels[2])
+                    odds_in = {"h": oh if oh > 1 else None, "d": od if od > 1 else None,
+                               "a": oa if oa > 1 else None, "o25": oo if oo > 1 else None,
+                               "u25": ou if ou > 1 else None}
+                    verif, evj = AgentCouncil.verificacao_ev(probs, odds_in)
+                    odds_txt = " | ".join(f"{k} @{v:.2f}" for k, v in odds_in.items() if v)
+                    with st.spinner("Juiz (Agente 5)…"):
+                        sint = conselho.julgar(str(dt.date.today()), fase0_txt, jogo_nome,
+                                               odds_txt or "não fornecidas", rels, verif)
+                    db.save_agent_pred(jogo_nome, odds_txt, json.dumps(probs or {}),
+                                       json.dumps(evj), sint)
+                    st.session_state["cons_out"] = {"rels": rels, "verif": verif,
+                                                    "sint": sint, "dossier": dossier}
+                except Exception as e:
+                    st.error(f"Conselho falhou: {e}")
+
+            out = st.session_state.get("cons_out")
+            if out:
+                with st.expander("📄 Dossier enviado"):
+                    st.code(out["dossier"])
+                for i, r in enumerate(out["rels"], 1):
+                    with st.expander(f"Relatório Agente {i}"):
+                        st.markdown(r)
+                st.code(out["verif"])
+                st.markdown("### 🧑‍⚖️ Síntese do Juiz (Agente 5)")
+                st.markdown(out["sint"])
 
 
 if __name__ == "__main__":
