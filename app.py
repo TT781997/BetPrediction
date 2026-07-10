@@ -51,12 +51,13 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Fi
 FACT = [math.factorial(k) for k in range(CFG["nmax"] + 1)]
 
 NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NIM_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 NIM_DEFAULTS = {
-    "agente1": "mistralai/mistral-large-2-instruct",
-    "agente2": "cohere/command-r-plus-08-2024",
-    "agente3": "qwen/qwen2-72b-instruct",
-    "agente4": "nvidia/nemotron-4-340b-instruct",
-    "agente5": "meta/llama-3.1-405b-instruct",
+    "agente1": "deepseek-ai/deepseek-v4-flash",
+    "agente2": "moonshotai/kimi-k2.5",
+    "agente3": "qwen/qwen3-32b",
+    "agente4": "nvidia/nemotron-3-super-120b",
+    "agente5": "nvidia/nemotron-3-ultra-550b-a55b",
 }
 
 CALIB_ATIVA_DEFAULT = """1) +0.20 lambda/equipa em pre-eliminatorias de julho; Under em Q1 so com odd >= fair x1.10.
@@ -799,7 +800,9 @@ class AgentCouncil:
             "model": modelo, "temperature": 0.25, "max_tokens": 800,
             "messages": [{"role": "system", "content": system + SUFIXO_ANTI_ALUCINACAO},
                          {"role": "user", "content": user}]})
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"{r.status_code} no modelo '{modelo}': {r.text[:180]} "
+                               "(usa 'Listar modelos da conta' para ver os IDs válidos)")
         return r.json()["choices"][0]["message"]["content"]
 
     async def _paralelo(self, dossier: str) -> list[str]:
@@ -1283,26 +1286,49 @@ def setup_ui():
             st.caption("Pipeline: Agentes 1-4 em paralelo (NIM) → verificação determinística de EV "
                        "em Python → Agente 5 (juiz) com FASE 0. O EV calculado prevalece sempre "
                        "sobre o que os modelos afirmarem.")
-            with st.expander("Modelos NIM (editáveis — o catálogo muda de nomes)"):
+            with st.expander("Modelos NIM — lê o catálogo da TUA conta", expanded=True):
+                if st.button("🔄 Listar modelos da conta (/v1/models)"):
+                    try:
+                        rr = requests.get(NIM_MODELS_URL, timeout=25,
+                                          headers={"Authorization": f"Bearer {k_nim.strip()}"})
+                        rr.raise_for_status()
+                        st.session_state["nim_lista"] = sorted(
+                            m["id"] for m in rr.json().get("data", []) if m.get("id"))
+                        st.success(f"{len(st.session_state['nim_lista'])} modelos disponíveis.")
+                    except Exception as e:
+                        st.error(f"Listagem falhou: {e}")
+                lista = st.session_state.get("nim_lista", [])
                 modelos = {}
                 for i in range(1, 6):
-                    modelos[f"agente{i}"] = st.text_input(
-                        f"Agente {i}", cfg_db.get(f"nim_agente{i}", NIM_DEFAULTS[f"agente{i}"]),
-                        key=f"nim_m{i}")
-                cA, cB = st.columns(2)
+                    guardado = cfg_db.get(f"nim_agente{i}", NIM_DEFAULTS[f"agente{i}"])
+                    if lista:
+                        ops = ([guardado] if guardado not in lista else []) + lista
+                        modelos[f"agente{i}"] = st.selectbox(f"Agente {i}", ops,
+                                                             index=ops.index(guardado),
+                                                             key=f"nim_m{i}")
+                    else:
+                        modelos[f"agente{i}"] = st.text_input(f"Agente {i}", guardado,
+                                                              key=f"nim_m{i}")
+                cA, cB, cC = st.columns(3)
                 if cA.button("Guardar modelos"):
                     db.set_config({f"nim_agente{i}": modelos[f"agente{i}"] for i in range(1, 6)})
                     st.success("Modelos guardados.")
-                if cB.button("Testar ligação NIM"):
-                    try:
-                        c5 = AgentCouncil(k_nim, modelos)
-                        async def _ping():
-                            async with httpx.AsyncClient(timeout=30,
-                                    headers={"Authorization": f"Bearer {c5.key}"}) as cli:
-                                return await c5._um(cli, modelos["agente5"], "Responde só: ok", "ping")
-                        st.success("NIM OK: " + asyncio.run(_ping())[:40])
-                    except Exception as e:
-                        st.error(f"Falhou: {e}")
+                if cB.button("Repor sugestões 2026"):
+                    db.set_config({f"nim_agente{i}": NIM_DEFAULTS[f"agente{i}"] for i in range(1, 6)})
+                    st.rerun()
+                if cC.button("Testar os 5 agentes"):
+                    c5 = AgentCouncil(k_nim, modelos)
+                    async def _ping_todos():
+                        async with httpx.AsyncClient(timeout=40,
+                                headers={"Authorization": f"Bearer {c5.key}"}) as cli:
+                            return await asyncio.gather(
+                                *[c5._um(cli, modelos[f"agente{i}"], "Responde só: ok", "ping")
+                                  for i in range(1, 6)], return_exceptions=True)
+                    for i, res in enumerate(asyncio.run(_ping_todos()), 1):
+                        if isinstance(res, str):
+                            st.success(f"Agente {i} ({modelos[f'agente{i}']}) ✓")
+                        else:
+                            st.error(f"Agente {i}: {res}")
 
             st.subheader("FASE 0 — previsões por liquidar")
             abertas = db.agent_preds_abertas()
