@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import sqlite3
 import statistics
@@ -60,6 +61,55 @@ NIM_DEFAULTS = {
     "agente5": "nvidia/nemotron-3-ultra-550b-a55b",
 }
 
+NIM_EXCLUIR = ("embed", "rerank", "retriev", "ocr", "guard", "safety", "clip", "image",
+               "video", "audio", "speech", "tts", "asr", "parakeet", "fastpitch", "riva",
+               "stable", "sdxl", "flux", "paddle", "protein", "weather", "genmol", "molmim",
+               "diffdock", "detector", "vila", "-vl", "vl-", "vision", "voice", "studio")
+NIM_BONUS = {"nemotron": 120, "deepseek": 100, "qwen": 100, "glm": 100, "llama": 90,
+             "kimi": 90, "moonshot": 90, "minimax": 80, "gpt-oss": 80, "mistral": 70,
+             "mixtral": 60, "gemma": 40}
+NIM_MATH = ("qwen", "deepseek", "glm", "nemotron")
+NIM_RAPIDO = ("flash", "nano", "mini", "small", "turbo", "lite")
+
+
+def escolher_melhores(lista: list[str]) -> dict:
+    """Filtra a listagem da conta e distribui os 5 melhores LLMs pelos papeis."""
+    cand = []
+    for mid in lista:
+        low = mid.lower()
+        if any(x in low for x in NIM_EXCLUIR):
+            continue
+        mx = re.search(r"(\d+)x(\d+(?:\.\d+)?)b", low)
+        m = re.search(r"(\d+(?:\.\d+)?)b", low)
+        tam = float(mx.group(1)) * float(mx.group(2)) if mx else (float(m.group(1)) if m else 20.0)
+        bonus = max((v for k, v in NIM_BONUS.items() if k in low), default=0)
+        if bonus == 0 and not m:
+            continue
+        cand.append((tam + bonus, tam, mid, low))
+    if len(cand) < 5:
+        raise RuntimeError(f"só {len(cand)} LLMs de chat reconhecidos na listagem")
+    pool = sorted(cand, key=lambda x: -x[0])[:8]
+    usados, picks = set(), {}
+
+    def tira(pred, fallback_ordem):
+        for _, _, mid, low in fallback_ordem:
+            if mid not in usados and pred(low):
+                usados.add(mid)
+                return mid
+        for _, _, mid, _ in fallback_ordem:
+            if mid not in usados:
+                usados.add(mid)
+                return mid
+
+    picks["agente5"] = tira(lambda l: True, pool)                                   # juiz: maior
+    picks["agente3"] = tira(lambda l: any(f in l for f in NIM_MATH), pool)          # matematico
+    picks["agente1"] = tira(lambda l: any(f in l for f in NIM_RAPIDO),
+                            sorted(pool, key=lambda x: x[1]))                       # dados: rapido
+    picks["agente4"] = tira(lambda l: True, pool)
+    picks["agente2"] = tira(lambda l: True, pool)
+    return picks
+
+
 CALIB_ATIVA_DEFAULT = """1) +0.20 lambda/equipa em pre-eliminatorias de julho; Under em Q1 so com odd >= fair x1.10.
 2) Premio clean-sheet (+10% P CS) so para equipas em ritmo competitivo (epoca/torneio a decorrer).
 3) Choque-de-mercado: desvio >= 6 p.p. modelo-mercado -> mover 50% em direcao ao mercado.
@@ -67,7 +117,9 @@ CALIB_ATIVA_DEFAULT = """1) +0.20 lambda/equipa em pre-eliminatorias de julho; U
 
 
 def montar_dossier(nome, liga, hora, lam, fontes_lam, odds_pre, notas, calib):
-    linhas = [f"JOGO: {nome} | COMPETIÇÃO: {liga} | HORA UTC: {hora}", ""]
+    linhas = [f"JOGO: {nome} | COMPETIÇÃO: {liga} | HORA UTC: {hora}",
+              f"TIMESTAMP DO DOSSIER (UTC): {dt.datetime.now(dt.timezone.utc).isoformat(timespec='minutes')} "
+              "— odds/λ/Elo recolhidos nesta sessão (freshness <7 dias)", ""]
     if lam:
         linhas.append(f"λ IMPLÍCITOS DO MERCADO (Poisson invertido do consenso devigado): "
                       f"casa {lam[0]} | fora {lam[1]} (origem: {fontes_lam})")
@@ -282,6 +334,21 @@ class MathEngine:
     @staticmethod
     def ev(p: float, odd: float) -> float:
         return p * odd - 1.0
+
+    @staticmethod
+    def lambdas_de_elo(elo_h: float, elo_a: float, vantagem: float = 65.0,
+                       total: float = 2.7) -> tuple[float, float]:
+        p = 1.0 / (1.0 + 10 ** (-((elo_h + vantagem) - elo_a) / 400.0))
+        alvo = (2 * p - 1) * 0.74
+        e0 = MathEngine()
+        lim = min(2.4, total - 0.1)
+        lo, hi = -lim, lim
+        for _ in range(50):
+            s = (lo + hi) / 2
+            pr = e0.market_probs(max(0.05, (total + s) / 2), max(0.05, (total - s) / 2))
+            lo, hi = (s, hi) if (pr["home"] - pr["away"]) < alvo else (lo, s)
+        s = (lo + hi) / 2
+        return round(max(0.05, (total + s) / 2), 2), round(max(0.05, (total - s) / 2), 2)
 
     @staticmethod
     def implied_lambdas(p1: float, p2: float, p_over25: float | None = None) -> tuple[float, float]:
@@ -576,8 +643,25 @@ class DataScraper:
     def consenso_tipsters(self, *a):  # PredictZ/Betensured — apenas validacao, nao implementado
         return None
 
+    def clubelo(self, d: dt.date | None = None) -> dict:
+        """Elo de clubes (api.clubelo.com, CSV publico). {} em falha."""
+        try:
+            txt = self._get(f"http://api.clubelo.com/{(d or dt.date.today()).isoformat()}")
+            elos = {}
+            for ln in txt.splitlines()[1:]:
+                p = ln.split(",")
+                if len(p) >= 5 and p[1]:
+                    try:
+                        elos[p[1]] = float(p[4])
+                    except ValueError:
+                        pass
+            return elos
+        except Exception:
+            return {}
+
     # ---------- consenso do prior ----------
-    def build_prior(self, home: str, away: str, liga: str, overrides: dict | None = None) -> dict:
+    def build_prior(self, home: str, away: str, liga: str, overrides: dict | None = None,
+                    elos: dict | None = None) -> dict:
         """Media ponderada das fontes que responderem; fallback = baseline da competicao."""
         if overrides and overrides.get("lh") and overrides.get("la"):
             return {"lh": overrides["lh"], "la": overrides["la"], "fontes": "manual"}
@@ -599,6 +683,14 @@ class DataScraper:
                 pesos_lh.append(((uh["xg5"] + ua["xga5"]) / 2 * 1.05, 0.6))   # +5% casa
                 pesos_la.append(((ua["xg5"] + uh["xga5"]) / 2 * 0.95, 0.6))
                 fontes.append("understat")
+        if elos and fuzzproc and not fontes:
+            hh = fuzzproc.extractOne(home, list(elos), scorer=fuzz.token_set_ratio, score_cutoff=78)
+            aa = fuzzproc.extractOne(away, list(elos), scorer=fuzz.token_set_ratio, score_cutoff=78)
+            if hh and aa:
+                lh_e, la_e = MathEngine.lambdas_de_elo(elos[hh[0]], elos[aa[0]])
+                pesos_lh.append((lh_e, 0.55))
+                pesos_la.append((la_e, 0.55))
+                fontes.append("clubelo")
         base = CFG["baseline"]
         pesos_lh.append((base["home"], 0.4 if fontes else 1.0))
         pesos_la.append((base["away"], 0.4 if fontes else 1.0))
@@ -732,59 +824,81 @@ class OddsProvider:
         return {k: {"best": max(v), "med": statistics.median(v)} for k, v in precos.items()}
 
 
+def eh_knockout(liga: str) -> bool:
+    l = (liga or "").lower()
+    return any(x in l for x in ("cup", "copa", "taça", "champions", "europa", "conference",
+                                "qualif", "mundial", "world", "playoff", "knockout", "libertadores"))
+
+
 SUFIXO_ANTI_ALUCINACAO = ("\n\nREGRA DURA: se uma fonte não constar do DOSSIER fornecido, "
                           "declara-a como INDISPONÍVEL e nunca inventes números para ela.")
 
 AGENT_SYSTEMS = {
-    "agente1": """Atua como Analista de Dados Desportivos de Elite, 100% objetivo.
-Processa soccerdata/FotMob/FootyStats/Understat: xG/xGA/xPTS (5 jogos), PPDA, passes progressivos, set-pieces, xG tempo real, BTTS, Cantos, conversion rate elite.
-Declara lacunas explicitamente e usa média da liga.
-Saída OBRIGATÓRIA:
-## Métricas Processadas
-- lista bullet
-## Lacunas de Dados
-## Resumo Frio (3 frases máx.)
+    "agente1": """Atua como o DATA QUALITY ENGINE do framework AQPD v1.3. 100% objetivo. Nunca inventes dados.
+A partir do DOSSIER, produz EXATAMENTE:
+## ESTADO DOS DADOS
+| Variável | Valor | Fonte | Classe | Freshness | Confiança |
+Variáveis e pesos: xG/xGA(2), Odds(2), Lesões(1.5), XI(1.5), Suspensões(1), Forma(1), Calendário/Fadiga(1), Árbitro(0.5), H2H(1).
+Classes: A=API oficial/validada; B=confirmado por ≥2 fontes; C=1 fonte reconhecida; D=estimativa histórica; E=indisponível. NUNCA converter E em D silenciosamente.
+Freshness: <7 dias=100% | 7-30=90% | 30-90=70% | >90=histórico apenas.
+## DATA QUALITY SCORE
+Score = (Σ pesos disponíveis × Freshness × Reliability) / Σ pesos totais — mostra o cálculo passo a passo.
+Estado: ≥85% robusto | 80-85% análise com cautela | <80% SEM análise quantitativa (declara-o).
+## LACUNAS DE DADOS
+Para cada falta usa a frase: "Dado indisponível. Utilizadas apenas informações históricas ou médias competitivas devidamente identificadas."
 Não prevejas.""",
-    "agente2": """Atua como Analista Tático de Elite, 100% frio. Cruza Agente 1 com FotMob (line-ups/lesões), TotalCorner (momentum), relatórios jogadores. Avalia impacto tático real, motivação e ameaças (set-pieces/contra-ataque).
+    "agente2": """Atua como Analista Tático de Elite do AQPD v1.3, 100% frio. Cruza o relatório de dados com line-ups/lesões e contexto. Avalia impacto tático real, motivação e ameaças (set-pieces/contra-ataque) e as variáveis de contexto: fator casa, fadiga, dias de descanso, viagens, importância competitiva, knockout, derby.
 Saída OBRIGATÓRIA:
 ## Impacto Tático
 ## Fatores Decisivos
-Ignora hype.""",
-    "agente3": """Estatístico Matemático. Modela Poisson + Elo (Forebet/KickForm).
-OBRIGATÓRIO aplicar calibrações:
-- Knockout: +25% finishing elite, -15% xG bruto
-- Variância: +20% se |xG diff| <1.0
-- Cartões: +15% variância Poisson
-- Over bias se xG total >2.8-3.0 + ameaças
-- Baseline knockout: +0.15-0.25 xG/equipa
-Calcula Fair Odds ajustadas.
+## Contexto (fadiga / knockout / derby)
+Ignora hype. Lacunas ficam explícitas.""",
+    "agente3": """Estatístico Matemático do AQPD v1.3. Modela o ENSEMBLE:
+- Base 40%: Poisson, Dixon-Coles, Elo dinâmico;
+- Avançado 30%: Bivariate Poisson, Monte Carlo, Bayesian updating;
+- Contextual 30%: lesões, fadiga, arbitragem, set-pieces, finishing, knockout, derby.
+CONTROLO DE OVERFITTING: nenhum ajuste contextual altera a previsão base além de ±15% (exceções: lesão extrema, expulsão, mudança estrutural de treinador — justificar).
+ANÁLISE DE DISPERSÃO: se prob_max−prob_min >15 p.p. entre modelos ou os modelos discordarem do vencedor → declara ALTA INCERTEZA (sem Value Bet).
 Saída OBRIGATÓRIA:
+## Ensemble (Base / Avançado / Contextual e ponderação 40/30/30)
 ## Probabilidades Reais (Fair Odds)
 1: % | X: % | 2: %
 Over 2.5: % | Under: %
-## Calibrações Aplicadas
-No FIM, inclui SEMPRE um bloco de código json exatamente neste formato:
+## Calibrações e Ajustes Aplicados (cada um com o seu ±)
+No FIM inclui SEMPRE um bloco de código json exatamente neste formato:
 ```json
 {"p1": 0.00, "px": 0.00, "p2": 0.00, "over25": 0.00}
 ```""",
-    "agente4": """Gestor de Risco. Cruza Fair Odds com Betdiary (dropping >10%), xGscore, consenso (validação). Deteta EV+ ou "No Bet".
+    "agente4": """Gestor de Risco do AQPD v1.3. Aplica o VALUE BET ENGINE — só recomendar se TODOS os gates passarem:
+EV ≥ +5% | mercado − fair ≥ 0.10 | liquidez suficiente | confiança ≥ Média | Data Quality ≥ 85% (relatório do Agente 1).
+Caso contrário escreve: "No Bet Zone — Apenas análise."
+GESTÃO DE STAKE: Kelly × 0.25; limites: alta 2% máx | média 1% máx | baixa 0%; knockout/derby: reduzir 50%.
+MODEL RISK CONTROL: dependência excessiva de uma variável, divergência modelo/mercado, sequência negativa → reduzir confiança.
 Saída OBRIGATÓRIA:
 ## Comparação Odds
-## Value Bets / EV+
+## Value Bets / No Bet Zone (gates avaliados um a um)
+## Stake (1/4-Kelly com limites)
 ## Decisão Final""",
-    "agente5": """Juiz Principal com auto-correção rigorosa.
-FASE 0 OBRIGATÓRIA (template exato):
-- Jogo: [ ] | Real: [ ] | Previsão anterior: [ ]
-- Diagnóstico Técnico: [ ]
-- Lição + Ajuste Quantitativo: [ ]
-Resumo Calibração Ativa no fim.
-Depois SÍNTESE FINAL com relatórios 1-4 + Fase 0.
-Saída OBRIGATÓRIA:
-## FASE 0 - Auditoria
-[template + resumo calibração]
-## SÍNTESE FINAL
-Previsão: ... | EV+: % | Aposta: [ ] ou "No Bet" | Confiança: N/10 | Justificativa: [2 frases]
-NOTA: a secção VERIFICAÇÃO DETERMINÍSTICA do prompt foi calculada em Python e prevalece sobre qualquer EV que os relatórios afirmem.""",
+    "agente5": """Juiz Principal do AQPD v1.3 — Analista Quantitativo Institucional com auto-correção rigorosa.
+Prioridades: calibração estatística, Brier/Log Loss, zero invenção de dados. Separa SEMPRE: 1) Probabilidade ("o que o modelo acredita") e 2) Mercado ("existe valor neste preço?"). Nunca transformar previsão automaticamente em aposta.
+A secção VERIFICAÇÃO DETERMINÍSTICA (calculada em Python) PREVALECE sobre qualquer EV, Kelly ou stake afirmado pelos relatórios.
+OUTPUT OBRIGATÓRIO (preenche apenas com o que os relatórios e a verificação suportam; lacunas explícitas):
+AQPD v1.3 — RELATÓRIO QUANTITATIVO
+Data: [hoje]
+## FASE 0 — RETROAÇÃO E POST-MATCH LEARNING
+| Jogo | Previsão | Resultado | Erro | Causa | Ajuste |
+(Se não existir histórico: "Histórico anterior inexistente. Calibração inicial baseada nos pesos padrão do ensemble.")
+## ESTADO DOS DADOS
+(tabela do Agente 1 + Data Quality Score; se <80% → "Sem análise quantitativa" e não emitas mercados nem Value Bets)
+## ANÁLISE DO JOGO
+Fontes (classe/freshness) · Contexto (3-4 frases) · Modelo (xG casa/fora; ensemble 40/30/30; ajustes com ±) · Probabilidades finais + Fair Odds · Top 3 resultados exatos · Golos/BTTS · Cantos
+## DECISÃO
+Probabilidade do Modelo: "O cenário mais provável é…"
+Decisão de Mercado: Value Bet SIM/NÃO + motivo (gates um a um) | Stake: usa os números da verificação determinística
+## FECHO
+Factos confirmados / Inferências do modelo / Grau de confiança / Intervalo de confiança
+## AUDITORIA FINAL
+☑ Probabilidades=100% ☑ Fair Odds coerentes ☑ Fontes e freshness registados ☑ Nenhuma métrica inventada ☑ EV validado pela verificação ☑ Model Risk avaliado""",
 }
 
 
@@ -795,14 +909,21 @@ class AgentCouncil:
         self.key = (api_key or "").strip()
         self.modelos = modelos
 
-    async def _um(self, client, modelo: str, system: str, user: str) -> str:
-        r = await client.post(NIM_URL, json={
-            "model": modelo, "temperature": 0.25, "max_tokens": 800,
-            "messages": [{"role": "system", "content": system + SUFIXO_ANTI_ALUCINACAO},
-                         {"role": "user", "content": user}]})
+    async def _um(self, client, modelo: str, system: str, user: str,
+                  max_tokens: int = 900) -> str:
+        corpo = {"model": modelo, "temperature": 0.25, "max_tokens": max_tokens,
+                 "messages": [{"role": "system", "content": system + SUFIXO_ANTI_ALUCINACAO},
+                              {"role": "user", "content": user}]}
+        r = None
+        for pausa in (0, 3, 8, 16):
+            if pausa:
+                await asyncio.sleep(pausa + random.uniform(0, 2))
+            r = await client.post(NIM_URL, json=corpo)
+            if r.status_code not in (429, 500, 502, 503, 504):
+                break
         if r.status_code >= 400:
             raise RuntimeError(f"{r.status_code} no modelo '{modelo}': {r.text[:180]} "
-                               "(usa 'Listar modelos da conta' para ver os IDs válidos)")
+                               "(usa 'Listar modelos da conta' / ⭐ auto-seleção)")
         return r.json()["choices"][0]["message"]["content"]
 
     async def _paralelo(self, dossier: str) -> list[str]:
@@ -834,35 +955,50 @@ class AgentCouncil:
             return None
 
     @staticmethod
-    def verificacao_ev(probs: dict | None, odds: dict) -> tuple[str, dict]:
+    def verificacao_ev(probs: dict | None, odds: dict, knockout: bool = False) -> tuple[str, dict]:
         if not probs:
             return ("Agente 3 não devolveu JSON válido — EV NÃO verificável; "
-                    "por regra, sem verificação = No Bet."), {}
+                    "por regra AQPD: No Bet Zone — Apenas análise."), {}
         pares = [("1", probs["p1"], odds.get("h")), ("X", probs["px"], odds.get("d")),
                  ("2", probs["p2"], odds.get("a")), ("Over 2.5", probs["over25"], odds.get("o25")),
                  ("Under 2.5", 1 - probs["over25"], odds.get("u25"))]
         linhas, evj = [], {}
         for lab, p, odd in pares:
             if odd and odd > 1 and p > 1e-4:
+                fair = 1 / p
                 ev = p * odd - 1
                 evj[lab] = round(ev, 4)
-                linhas.append(f"{lab}: fair {1/p:.2f} vs mercado {odd:.2f} -> EV {ev*100:+.1f}%"
-                              + ("  [EV+]" if ev >= 0.05 else ""))
-        txt = ("=== VERIFICAÇÃO DETERMINÍSTICA (Python; prevalece sobre os relatórios) ===\n"
+                gate = ev >= 0.05 and (odd - fair) >= 0.10
+                kelly = max(0.0, ev / (odd - 1))
+                fator = 0.5 if knockout else 1.0
+                s_alta = min(0.02, kelly * 0.25) * fator
+                s_media = min(0.01, kelly * 0.25) * fator
+                linhas.append(f"{lab}: fair {fair:.2f} vs mercado {odd:.2f} | EV {ev*100:+.1f}% | "
+                              f"gates(EV≥5% e mercado−fair≥0.10): {'PASSA' if gate else 'NÃO passa'} | "
+                              f"stake 1/4-Kelly: {s_alta*100:.2f}% (conf. alta) / {s_media*100:.2f}% (média)")
+        txt = ("=== VERIFICAÇÃO DETERMINÍSTICA AQPD (Python; prevalece sobre os relatórios) ===\n"
                + "\n".join(linhas)
-               + "\nRegra: EV+ exige mercado > fair (p*odd-1 >= +5%).")
+               + "\nNotas: valor exige mercado ACIMA da fair (o 'fair−mercado≥0.10' do documento "
+                 "foi implementado como mercado−fair≥0.10); "
+               + ("knockout/derby ativo → stakes já reduzidos 50%; " if knockout else "")
+               + "confiança baixa → stake 0% independentemente do EV.")
         return txt, evj
 
     def julgar(self, data_hoje: str, fase0: str, jogo: str, odds_txt: str,
                rels: list[str], verif: str) -> str:
-        user = (f"DATA: {data_hoje}\n=== FASE 0 (ONTEM) ===\n{fase0 or 'Sem previsões anteriores registadas.'}\n"
+        user = (f"DATA: {data_hoje}\n=== FASE 0 (RESULTADOS ANTERIORES) ===\n"
+                f"{fase0 or 'Histórico anterior inexistente. Calibração inicial baseada nos pesos padrão do ensemble.'}\n"
                 f"=== JOGO HOJE ===\nJogo: {jogo} | Odds PT: {odds_txt}\n"
                 + "".join(f"\n--- RELATÓRIO {i+1} ---\n{r}\n" for i, r in enumerate(rels))
-                + f"\n{verif}\n\nExecuta FASE 0 (template) + SÍNTESE FINAL (formato acima).")
+                + f"\n{verif}\n\nProduz o RELATÓRIO QUANTITATIVO AQPD v1.3 completo no formato "
+                  "OBRIGATÓRIO do teu system prompt. Preenche cada secção só com o que os relatórios "
+                  "e a verificação suportam; lacunas ficam explícitas; Data Quality <80% bloqueia "
+                  "mercados e Value Bets.")
         async def _run():
             async with httpx.AsyncClient(timeout=120,
                                          headers={"Authorization": f"Bearer {self.key}"}) as c:
-                return await self._um(c, self.modelos["agente5"], AGENT_SYSTEMS["agente5"], user)
+                return await self._um(c, self.modelos["agente5"], AGENT_SYSTEMS["agente5"], user,
+                                      max_tokens=1700)
         return asyncio.run(_run())
 
     def correr_analistas(self, dossier: str) -> list[str]:
@@ -989,6 +1125,8 @@ def setup_ui():
             except Exception as e:
                 st.error(f"Fixtures falharam: {e}")
                 jogos = []
+            if "elos" not in st.session_state:
+                st.session_state["elos"] = scraper.clubelo()
             linhas = []
             for j in jogos:
                 odds_pre = oddsp.prematch(j["liga"], j["home"], j["away"])
@@ -1003,7 +1141,8 @@ def setup_ui():
                     lh, la = MathEngine.implied_lambdas(p1, p2, po)
                     pri = {"lh": lh, "la": la, "fontes": "odds-implied"}
                 else:
-                    pri = scraper.build_prior(j["home"], j["away"], j["liga"])
+                    pri = scraper.build_prior(j["home"], j["away"], j["liga"],
+                                              elos=st.session_state.get("elos"))
                 p = engine.market_probs(pri["lh"], pri["la"])
                 melhor = None
                 for mk in ("home", "draw", "away", "over25", "under25"):
@@ -1297,6 +1436,20 @@ def setup_ui():
                         st.success(f"{len(st.session_state['nim_lista'])} modelos disponíveis.")
                     except Exception as e:
                         st.error(f"Listagem falhou: {e}")
+                if st.button("⭐ Escolher os 5 melhores automaticamente"):
+                    try:
+                        lst = st.session_state.get("nim_lista")
+                        if not lst:
+                            rr = requests.get(NIM_MODELS_URL, timeout=25,
+                                              headers={"Authorization": f"Bearer {k_nim.strip()}"})
+                            rr.raise_for_status()
+                            lst = sorted(m["id"] for m in rr.json().get("data", []) if m.get("id"))
+                            st.session_state["nim_lista"] = lst
+                        picks = escolher_melhores(lst)
+                        db.set_config({f"nim_agente{i}": picks[f"agente{i}"] for i in range(1, 6)})
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Auto-seleção falhou: {e}")
                 lista = st.session_state.get("nim_lista", [])
                 modelos = {}
                 for i in range(1, 6):
@@ -1363,6 +1516,8 @@ def setup_ui():
             oa = o3.number_input("Odd 2", 1.0, 100.0, 1.0, 0.01, key="c_oa")
             oo = o4.number_input("Over 2.5", 1.0, 100.0, 1.0, 0.01, key="c_oo")
             ou = o5.number_input("Under 2.5", 1.0, 100.0, 1.0, 0.01, key="c_ou")
+            ko = st.checkbox("Knockout / derby (AQPD: reduz stakes 50%)",
+                             value=eh_knockout(jsel["liga"] if jsel else ""), key="cons_ko")
             notas = st.text_area("Notas (lesões, onzes, contexto — cola aqui o que vires no FotMob)",
                                  height=90, key="cons_notas")
             calib_txt = st.text_area("Calibração ativa (editável; vai no dossier e para o juiz)",
@@ -1387,7 +1542,7 @@ def setup_ui():
                     odds_in = {"h": oh if oh > 1 else None, "d": od if od > 1 else None,
                                "a": oa if oa > 1 else None, "o25": oo if oo > 1 else None,
                                "u25": ou if ou > 1 else None}
-                    verif, evj = AgentCouncil.verificacao_ev(probs, odds_in)
+                    verif, evj = AgentCouncil.verificacao_ev(probs, odds_in, ko)
                     odds_txt = " | ".join(f"{k} @{v:.2f}" for k, v in odds_in.items() if v)
                     with st.spinner("Juiz (Agente 5)…"):
                         sint = conselho.julgar(str(dt.date.today()), fase0_txt, jogo_nome,
@@ -1409,6 +1564,61 @@ def setup_ui():
                 st.code(out["verif"])
                 st.markdown("### 🧑‍⚖️ Síntese do Juiz (Agente 5)")
                 st.markdown(out["sint"])
+
+            st.divider()
+            st.subheader("🗂️ Conselho em lote (máx. 20 jogos)")
+            sel_multi = st.multiselect("Jogos do Radar", list(ops), max_selections=20,
+                                       key="cons_multi",
+                                       help="Corre o pipeline completo por jogo, em sequência. "
+                                            "Odds para a verificação: melhores preços da the-odds-api "
+                                            "quando existam; sem odds, o juiz é instruído a No Bet.")
+            if st.button(f"🚀 Correr conselho para {len(sel_multi)} jogo(s)",
+                         type="primary", disabled=not sel_multi):
+                conselho = AgentCouncil(k_nim, modelos)
+                barra = st.progress(0.0, text="a iniciar…")
+                resumo = []
+                st.session_state["cons_lote"] = {}
+                for n, nome_j in enumerate(sel_multi):
+                    jj = ops[nome_j]
+                    barra.progress(n / len(sel_multi), text=f"{nome_j} ({n + 1}/{len(sel_multi)})")
+                    try:
+                        odds_pre = (oddsp.prematch(jj["liga"], jj["home"], jj["away"])
+                                    if oddsp.key else {})
+                        ob = {k2: v["best"] for k2, v in odds_pre.items()}
+                        odds_in = {"h": ob.get("home"), "d": ob.get("draw"), "a": ob.get("away"),
+                                   "o25": ob.get("over25"), "u25": ob.get("under25")}
+                        dossier = montar_dossier(nome_j.split(" (")[0], jj["liga"], jj["hora_utc"],
+                                                 (jj["lh"], jj["la"]), jj["fontes"], odds_pre,
+                                                 notas, calib_txt)
+                        rels = conselho.correr_analistas(dossier)
+                        probs = AgentCouncil.extrair_probs(rels[2])
+                        verif, evj = AgentCouncil.verificacao_ev(probs, odds_in,
+                                                                  eh_knockout(jj["liga"]))
+                        odds_txt = " | ".join(f"{k2} @{v:.2f}" for k2, v in odds_in.items() if v)
+                        sint = conselho.julgar(str(dt.date.today()), fase0_txt, nome_j,
+                                               odds_txt or "não fornecidas", rels, verif)
+                        db.save_agent_pred(nome_j, odds_txt, json.dumps(probs or {}),
+                                           json.dumps(evj), sint)
+                        m_ap = re.search(r"Aposta:\s*([^|\n]+)", sint)
+                        melhor = max(evj.items(), key=lambda x: x[1]) if evj else None
+                        resumo.append({"Jogo": nome_j,
+                                       "Aposta (juiz)": m_ap.group(1).strip()[:60] if m_ap else "—",
+                                       "Melhor EV (Python)": (f"{melhor[0]} {melhor[1]*100:+.1f}%"
+                                                              if melhor else "—")})
+                        st.session_state["cons_lote"][nome_j] = {"sint": sint, "verif": verif}
+                    except Exception as e:
+                        resumo.append({"Jogo": nome_j, "Aposta (juiz)": f"FALHOU: {e}",
+                                       "Melhor EV (Python)": "—"})
+                    time.sleep(3)
+                barra.progress(1.0, text="concluído ✓")
+                st.session_state["cons_lote_resumo"] = resumo
+            if st.session_state.get("cons_lote_resumo"):
+                st.dataframe(pd.DataFrame(st.session_state["cons_lote_resumo"]),
+                             use_container_width=True)
+                for nome_j, dd in st.session_state.get("cons_lote", {}).items():
+                    with st.expander(f"🧑‍⚖️ {nome_j}"):
+                        st.code(dd["verif"])
+                        st.markdown(dd["sint"])
 
 
 if __name__ == "__main__":
