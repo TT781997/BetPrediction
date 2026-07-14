@@ -45,6 +45,16 @@ CFG = {
     "db": "quant_desk.db",
     "baseline": {"home": 1.40, "away": 1.15},     # fallback quando nenhuma fonte devolve dados
     "calib_min_n": 30, "calib_clamp": (0.85, 1.15),
+    "sd_cache": os.path.expanduser("~/.quantdesk/soccerdata"),
+    "sd_leagues": {   # nome ESPN -> id soccerdata (FBref)
+        "English Premier League": "ENG-Premier League",
+        "Spanish LaLiga": "ESP-La Liga",
+        "Italian Serie A": "ITA-Serie A",
+        "German Bundesliga": "GER-Bundesliga",
+        "French Ligue 1": "FRA-Ligue 1",
+        "Primeira Liga": "POR-Primeira Liga",
+        "Liga Portugal": "POR-Primeira Liga",
+    },
 }
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
       "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8"}
@@ -92,28 +102,71 @@ NIM_TOP5 = {
 
 
 async def auto_selecionar(top5: dict, disponiveis: set, key: str) -> dict:
-    """Ping ao 1º da lista de cada papel que exista na conta; escolhe o que responde 200."""
+    """Ping ao 1º candidato que responder 200; se nenhum da lista curada passar, usa
+    fallback pela listagem da conta (chat LLM mais próximo do papel, pontuado por família/tamanho)."""
+    # Fallback pool: LLMs de chat na conta, com heurística de tamanho/família (excluir embed/OCR/etc.)
+    NIM_EXCLUIR = ("embed", "rerank", "retriev", "ocr", "guard", "safety", "clip", "vision",
+                   "video", "audio", "speech", "tts", "asr", "riva", "sdxl", "flux",
+                   "protein", "weather", "genmol", "molmim", "diffdock", "-vl", "vl-", "vila")
+    NIM_BONUS = {"nemotron": 120, "deepseek": 100, "qwen": 100, "glm": 100, "llama": 90,
+                 "kimi": 90, "moonshot": 90, "mistral": 70, "mixtral": 60, "gemma": 40,
+                 "phi": 50, "gpt-oss": 80, "minimax": 80}
+    pool_fb = []
+    for mid in disponiveis:
+        low = mid.lower()
+        if any(x in low for x in NIM_EXCLUIR):
+            continue
+        m = re.search(r"(\d+(?:\.\d+)?)b", low)
+        tam = float(m.group(1)) if m else 20.0
+        bonus = max((v for k, v in NIM_BONUS.items() if k in low), default=0)
+        if bonus == 0 and not m:
+            continue
+        pool_fb.append((tam + bonus, tam, mid, low))
+    pool_fb.sort(key=lambda x: -x[0])
+    NIM_MATH = ("qwen", "deepseek", "glm", "nemotron")
+    NIM_RAPIDO = ("flash", "nano", "mini", "small", "turbo", "lite", "8b", "9b", "12b")
+
+    async def ping(cli, mid):
+        try:
+            r = await cli.post(NIM_URL, json={"model": mid, "max_tokens": 5,
+                                              "messages": [{"role": "user", "content": "ok"}]})
+            return r.status_code == 200
+        except Exception:
+            return False
+
     async with httpx.AsyncClient(timeout=25,
                                  headers={"Authorization": f"Bearer {key}"}) as cli:
         picks, usados = {}, set()
+        # Fase 1: lista curada
         for agente, cands in top5.items():
-            picks[agente] = None
             for mid in cands:
                 if mid in usados or mid not in disponiveis:
                     continue
-                try:
-                    r = await cli.post(NIM_URL, json={"model": mid, "max_tokens": 5,
-                                                     "messages": [{"role": "user", "content": "ok"}]})
-                    if r.status_code == 200:
-                        picks[agente] = mid
-                        usados.add(mid)
-                        break
-                except Exception:
-                    continue
-    faltam = [a for a, v in picks.items() if v is None]
+                if await ping(cli, mid):
+                    picks[agente] = mid; usados.add(mid); break
+            else:
+                picks[agente] = None
+        # Fase 2: fallback pela heurística (só para papéis por preencher)
+        heur = {"agente5": lambda l: True,                              # juiz: maior
+                "agente3": lambda l: any(f in l for f in NIM_MATH),     # matemática
+                "agente1": lambda l: any(f in l for f in NIM_RAPIDO),   # rápido
+                "agente4": lambda l: True,
+                "agente2": lambda l: True}
+        # Preenche primeiro os papeis com heuristica restrita (ag3 math, ag1 rapido, ag5 juiz maior)
+        ordem_papeis = ["agente3", "agente1", "agente5", "agente4", "agente2"]
+        for agente in ordem_papeis:
+            if picks.get(agente):
+                continue
+            ordem = pool_fb if agente != "agente1" else sorted(pool_fb, key=lambda x: x[1])
+            preferidos = [x for x in ordem if heur[agente](x[3]) and x[2] not in usados]
+            outros = [x for x in ordem if x[2] not in usados and x not in preferidos]
+            for _, _, mid, _ in preferidos + outros:
+                if await ping(cli, mid):
+                    picks[agente] = mid; usados.add(mid); break
+    faltam = [a for a, v in picks.items() if not v]
     if faltam:
-        raise RuntimeError("Sem candidato válido para: " + ", ".join(faltam)
-                           + " — nenhum dos 5 sugeridos passou o ping.")
+        raise RuntimeError("Sem candidato para: " + ", ".join(faltam)
+                           + " — a listagem da conta não devolveu LLM de chat suficientes.")
     return picks
 
 
@@ -155,7 +208,13 @@ ESPN_PRESETS = {
     "Pedido do utilizador": [
         "fifa.world", "fifa.wwc", "fifa.olympics", "fifa.w.olympics", "fifa.cwc",
         "uefa.euro", "uefa.weuro", "conmebol.america", "concacaf.gold", "caf.nations",
-        "uefa.champions", "uefa.europa", "uefa.europa.conf",
+        # Qualificações de seleções (5 confederações + repescagens)
+        "fifa.worldq.uefa", "fifa.worldq.conmebol", "fifa.worldq.concacaf",
+        "fifa.worldq.afc", "fifa.worldq.caf", "fifa.worldq.ofc", "fifa.worldq.playoff",
+        "uefa.euroq", "uefa.weuroq",
+        # Clubes UEFA — pré-eliminatórias entram nos próprios códigos principais na ESPN
+        "uefa.champions", "uefa.europa", "uefa.europa.conf", "uefa.super_cup",
+        # Ligas domésticas do pedido
         "eng.1", "eng.2", "esp.1", "esp.2", "ger.1", "ger.2",
         "ita.1", "fra.1", "por.1",
     ],
@@ -179,6 +238,9 @@ FILTRO_LIGAS_PT = [
     r"club world cup", r"mundial de clubes",
     r"intercontinental",
     r"champions league", r"europa league", r"conference league",
+    r"champions league qualif", r"europa league qualif", r"conference league qualif",
+    r"world cup qualif", r"qualif(icação|icação|ying).*world", r"eliminat[oó]rias?.*mundial",
+    r"euro(pean)? qualif", r"nations league",
     r"premier league", r"championship\b",   # eng 1 e 2
     r"bundesliga",                             # apanha 1 e 2
     r"laliga|la liga|primera divisi[oó]n", r"laliga 2|segunda divisi[oó]n",
@@ -453,6 +515,122 @@ class BiasCalibrator:
 
 # ════════════════════════════════ SCRAPER (registo de fontes) ════════════════════════════════
 
+class SoccerDataSource:
+    """Wrapper com cache diária persistente sobre soccerdata.FBref.
+    - 1 descarga por liga/dia; resto do dia lê Parquet do disco.
+    - Devolve xG/xGA por 90 dos últimos 5-8 jogos e finishing efficiency por equipa.
+    - Nunca quebra o Radar: se soccerdata não estiver instalado ou a liga falhar, devolve {}.
+    """
+
+    def __init__(self, cache_dir: str = CFG["sd_cache"]):
+        self.dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self._mem: dict[tuple, pd.DataFrame] = {}
+        try:
+            import soccerdata as sd  # noqa: F401
+            self.ok = True
+        except ImportError:
+            self.ok = False
+
+    def _season(self, hoje: dt.date | None = None) -> int:
+        d = hoje or dt.date.today()
+        # Época europeia: agosto→maio; jul/ago = próxima época
+        return d.year if d.month >= 8 else d.year - 1
+
+    def _cache_path(self, liga_sd: str, season: int) -> str:
+        safe = liga_sd.replace("/", "_").replace(" ", "_")
+        return os.path.join(self.dir, f"{safe}_{season}_{dt.date.today().isoformat()}.parquet")
+
+    def team_stats(self, liga_espn: str, seasons: list[int] | None = None) -> pd.DataFrame:
+        """Devolve DataFrame com colunas ['team','xg90','xga90','finishing'] para a liga.
+        Empty DataFrame se indisponível."""
+        if not self.ok:
+            return pd.DataFrame()
+        liga_sd = CFG["sd_leagues"].get(liga_espn)
+        if not liga_sd:
+            return pd.DataFrame()
+        season = (seasons or [self._season()])[0]
+        chave = (liga_sd, season)
+        if chave in self._mem:
+            return self._mem[chave]
+        path = self._cache_path(liga_sd, season)
+        if os.path.exists(path):
+            try:
+                df = pd.read_parquet(path)
+                self._mem[chave] = df
+                return df
+            except Exception:
+                pass
+        try:
+            import soccerdata as sd
+            fb = sd.FBref(leagues=[liga_sd], seasons=[season],
+                          data_dir=os.path.join(self.dir, "raw"), no_cache=False)
+            std = fb.read_team_season_stats(stat_type="standard")
+            sht = fb.read_team_season_stats(stat_type="shooting")
+            std = std.reset_index()
+            sht = sht.reset_index()
+            std.columns = ["_".join(str(x) for x in c if x).strip("_") if isinstance(c, tuple)
+                           else c for c in std.columns]
+            sht.columns = ["_".join(str(x) for x in c if x).strip("_") if isinstance(c, tuple)
+                           else c for c in sht.columns]
+            def col(df, *nomes):
+                for n in nomes:
+                    for c in df.columns:
+                        if c.lower().replace(" ", "_") == n.lower().replace(" ", "_"):
+                            return c
+                return None
+            time_col = col(std, "team") or col(std, "squad")
+            jog_col = col(std, "playing_time_90s", "playing time_90s", "90s")
+            xg_col = col(std, "expected_xG", "expected xg", "xg")
+            xga_col = col(sht, "expected_xGA") or col(std, "expected_xGA")  # xGA vive em keeping
+            if xga_col is None:
+                try:
+                    kp = fb.read_team_season_stats(stat_type="keeper")
+                    kp = kp.reset_index()
+                    kp.columns = ["_".join(str(x) for x in c if x).strip("_")
+                                  if isinstance(c, tuple) else c for c in kp.columns]
+                    xga_col_k = col(kp, "expected_PSxG", "expected xg allowed", "xga")
+                    if xga_col_k:
+                        std = std.merge(kp[[time_col, xga_col_k]], on=time_col, how="left")
+                        xga_col = xga_col_k
+                except Exception:
+                    pass
+            gls_col = col(std, "performance_Gls", "performance gls", "goals")
+            if not (time_col and jog_col and xg_col):
+                return pd.DataFrame()
+            j = std[jog_col].astype(float).clip(lower=0.5)
+            out = pd.DataFrame({
+                "team": std[time_col],
+                "xg90": (std[xg_col].astype(float) / j).round(2),
+                "xga90": (std[xga_col].astype(float) / j).round(2) if xga_col else None,
+                "finishing": ((std[gls_col].astype(float) / std[xg_col].astype(float))
+                              .round(3) if gls_col else None),
+            })
+            out.to_parquet(path)
+            self._mem[chave] = out
+            return out
+        except Exception:
+            return pd.DataFrame()
+
+    def lookup(self, liga_espn: str, home: str, away: str) -> dict | None:
+        """{'lh_sd', 'la_sd', 'fin_h', 'fin_a'} ou None."""
+        df = self.team_stats(liga_espn)
+        if df.empty or not fuzzproc:
+            return None
+        nomes = list(df["team"].astype(str))
+        hh = fuzzproc.extractOne(home, nomes, scorer=fuzz.token_set_ratio, score_cutoff=78)
+        aa = fuzzproc.extractOne(away, nomes, scorer=fuzz.token_set_ratio, score_cutoff=78)
+        if not (hh and aa):
+            return None
+        h = df.iloc[hh[2]]; a = df.iloc[aa[2]]
+        # ataque casa vs defesa fora, com fator casa 1.05/0.95
+        lh = ((float(h["xg90"]) + float(a["xga90"] or h["xg90"])) / 2) * 1.05
+        la = ((float(a["xg90"]) + float(h["xga90"] or a["xg90"])) / 2) * 0.95
+        return {"lh_sd": round(lh, 2), "la_sd": round(la, 2),
+                "fin_h": float(h["finishing"]) if h["finishing"] else None,
+                "fin_a": float(a["finishing"]) if a["finishing"] else None}
+
+
 class DataScraper:
     """FotMob (fixtures + live) e Understat implementados; restantes fontes sao stubs
     com fallback — o consenso usa o que responder e nunca quebra a app."""
@@ -717,7 +895,7 @@ class DataScraper:
 
     # ---------- consenso do prior ----------
     def build_prior(self, home: str, away: str, liga: str, overrides: dict | None = None,
-                    elos: dict | None = None) -> dict:
+                    elos: dict | None = None, sd_source: SoccerDataSource | None = None) -> dict:
         """Media ponderada das fontes que responderem; fallback = baseline da competicao."""
         if overrides and overrides.get("lh") and overrides.get("la"):
             return {"lh": overrides["lh"], "la": overrides["la"], "fontes": "manual"}
@@ -736,9 +914,15 @@ class DataScraper:
         if lg_u:
             uh, ua = self.understat_team(home, lg_u), self.understat_team(away, lg_u)
             if uh and ua:
-                pesos_lh.append(((uh["xg5"] + ua["xga5"]) / 2 * 1.05, 0.6))   # +5% casa
+                pesos_lh.append(((uh["xg5"] + ua["xga5"]) / 2 * 1.05, 0.6))
                 pesos_la.append(((ua["xg5"] + uh["xga5"]) / 2 * 0.95, 0.6))
                 fontes.append("understat")
+        if sd_source is not None:
+            sdd = sd_source.lookup(liga, home, away)
+            if sdd:
+                pesos_lh.append((sdd["lh_sd"], 0.85))
+                pesos_la.append((sdd["la_sd"], 0.85))
+                fontes.append("fbref/soccerdata")
         if elos and fuzzproc:
             hh = fuzzproc.extractOne(home, list(elos), scorer=fuzz.token_set_ratio, score_cutoff=78)
             aa = fuzzproc.extractOne(away, list(elos), scorer=fuzz.token_set_ratio, score_cutoff=78)
@@ -1194,6 +1378,9 @@ def setup_ui():
                 jogos = []
             if "elos" not in st.session_state:
                 st.session_state["elos"] = scraper.clubelo()
+            if "sd_source" not in st.session_state:
+                st.session_state["sd_source"] = SoccerDataSource()
+            sd_src = st.session_state["sd_source"]
             linhas = []
             for j in jogos:
                 odds_pre = oddsp.prematch(j["liga"], j["home"], j["away"])
@@ -1209,7 +1396,8 @@ def setup_ui():
                     pri = {"lh": lh, "la": la, "fontes": "odds-implied"}
                 else:
                     pri = scraper.build_prior(j["home"], j["away"], j["liga"],
-                                              elos=st.session_state.get("elos"))
+                                              elos=st.session_state.get("elos"),
+                                              sd_source=sd_src)
                 p = engine.market_probs(pri["lh"], pri["la"])
                 melhor = None
                 for mk in ("home", "draw", "away", "over25", "under25"):
