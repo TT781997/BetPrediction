@@ -61,52 +61,59 @@ NIM_DEFAULTS = {
     "agente5": "nvidia/nemotron-3-ultra-550b-a55b",
 }
 
-NIM_EXCLUIR = ("embed", "rerank", "retriev", "ocr", "guard", "safety", "clip", "image",
-               "video", "audio", "speech", "tts", "asr", "parakeet", "fastpitch", "riva",
-               "stable", "sdxl", "flux", "paddle", "protein", "weather", "genmol", "molmim",
-               "diffdock", "detector", "vila", "-vl", "vl-", "vision", "voice", "studio")
-NIM_BONUS = {"nemotron": 120, "deepseek": 100, "qwen": 100, "glm": 100, "llama": 90,
-             "kimi": 90, "moonshot": 90, "minimax": 80, "gpt-oss": 80, "mistral": 70,
-             "mixtral": 60, "gemma": 40}
-NIM_MATH = ("qwen", "deepseek", "glm", "nemotron")
-NIM_RAPIDO = ("flash", "nano", "mini", "small", "turbo", "lite")
+# Top-5 curado por papel — todos NIM free tier. Ordenados por preferência.
+# Auto-seleção valida contra a listagem da conta e escolhe o primeiro que responde.
+NIM_TOP5 = {
+    "agente1": [  # Dados: rápido, bom seguidor de formato tabular
+        "deepseek-ai/deepseek-v4-flash", "meta/llama-3.1-8b-instruct",
+        "qwen/qwen3-32b", "microsoft/phi-4", "mistralai/mistral-nemo-12b-instruct",
+    ],
+    "agente2": [  # Tático: contexto longo, raciocínio narrativo
+        "moonshotai/kimi-k2.5", "meta/llama-3.3-70b-instruct",
+        "mistralai/mixtral-8x22b-instruct-v0.1", "nvidia/llama-3.1-nemotron-70b-instruct",
+        "cohere/command-r-plus-08-2024",
+    ],
+    "agente3": [  # Matemática/JSON: cadeia de raciocínio, disciplina numérica
+        "qwen/qwen3-32b", "deepseek-ai/deepseek-v4",
+        "zhipuai/glm-5.1", "nvidia/nemotron-3-super-120b",
+        "meta/llama-3.1-405b-instruct",
+    ],
+    "agente4": [  # Risco: síntese estruturada, decisões condicionais
+        "nvidia/nemotron-3-super-120b", "meta/llama-3.3-70b-instruct",
+        "qwen/qwen2.5-72b-instruct", "mistralai/mixtral-8x22b-instruct-v0.1",
+        "cohere/command-r-plus-08-2024",
+    ],
+    "agente5": [  # Juiz: o mais forte e/ou com raciocínio profundo
+        "nvidia/nemotron-3-ultra-550b-a55b", "meta/llama-3.1-405b-instruct",
+        "deepseek-ai/deepseek-v4", "qwen/qwen3.5-397b",
+        "nvidia/nemotron-3-super-120b",
+    ],
+}
 
 
-def escolher_melhores(lista: list[str]) -> dict:
-    """Filtra a listagem da conta e distribui os 5 melhores LLMs pelos papeis."""
-    cand = []
-    for mid in lista:
-        low = mid.lower()
-        if any(x in low for x in NIM_EXCLUIR):
-            continue
-        mx = re.search(r"(\d+)x(\d+(?:\.\d+)?)b", low)
-        m = re.search(r"(\d+(?:\.\d+)?)b", low)
-        tam = float(mx.group(1)) * float(mx.group(2)) if mx else (float(m.group(1)) if m else 20.0)
-        bonus = max((v for k, v in NIM_BONUS.items() if k in low), default=0)
-        if bonus == 0 and not m:
-            continue
-        cand.append((tam + bonus, tam, mid, low))
-    if len(cand) < 5:
-        raise RuntimeError(f"só {len(cand)} LLMs de chat reconhecidos na listagem")
-    pool = sorted(cand, key=lambda x: -x[0])[:8]
-    usados, picks = set(), {}
-
-    def tira(pred, fallback_ordem):
-        for _, _, mid, low in fallback_ordem:
-            if mid not in usados and pred(low):
-                usados.add(mid)
-                return mid
-        for _, _, mid, _ in fallback_ordem:
-            if mid not in usados:
-                usados.add(mid)
-                return mid
-
-    picks["agente5"] = tira(lambda l: True, pool)                                   # juiz: maior
-    picks["agente3"] = tira(lambda l: any(f in l for f in NIM_MATH), pool)          # matematico
-    picks["agente1"] = tira(lambda l: any(f in l for f in NIM_RAPIDO),
-                            sorted(pool, key=lambda x: x[1]))                       # dados: rapido
-    picks["agente4"] = tira(lambda l: True, pool)
-    picks["agente2"] = tira(lambda l: True, pool)
+async def auto_selecionar(top5: dict, disponiveis: set, key: str) -> dict:
+    """Ping ao 1º da lista de cada papel que exista na conta; escolhe o que responde 200."""
+    async with httpx.AsyncClient(timeout=25,
+                                 headers={"Authorization": f"Bearer {key}"}) as cli:
+        picks, usados = {}, set()
+        for agente, cands in top5.items():
+            picks[agente] = None
+            for mid in cands:
+                if mid in usados or mid not in disponiveis:
+                    continue
+                try:
+                    r = await cli.post(NIM_URL, json={"model": mid, "max_tokens": 5,
+                                                     "messages": [{"role": "user", "content": "ok"}]})
+                    if r.status_code == 200:
+                        picks[agente] = mid
+                        usados.add(mid)
+                        break
+                except Exception:
+                    continue
+    faltam = [a for a, v in picks.items() if v is None]
+    if faltam:
+        raise RuntimeError("Sem candidato válido para: " + ", ".join(faltam)
+                           + " — nenhum dos 5 sugeridos passou o ping.")
     return picks
 
 
@@ -493,9 +500,19 @@ class DataScraper:
                     liga = (lg_ev.get("name") if isinstance(lg_ev, dict) else
                             lg_ev if isinstance(lg_ev, str) else None)
                     if not liga:
+                        for path in (comp.get("league"), (comp.get("season") or {}).get("league"),
+                                     ev.get("season", {}).get("league")):
+                            if isinstance(path, dict) and path.get("name"):
+                                liga = path["name"]; break
+                    if not liga:
                         uid = str(ev.get("uid", ""))
                         if "l:" in uid:
                             liga = liga_por_id.get(uid.split("l:")[-1].split("~")[0])
+                    if not liga:
+                        slug = str(ev.get("links", [{}])[0].get("href", ""))
+                        m_slug = re.search(r"/soccer/([^/]+)/", slug)
+                        if m_slug:
+                            liga = m_slug.group(1).replace("-", " ").replace(".", " ").title()
                     liga = liga or liga_topo or ("?" if lg == "all" else lg)
                     jogos.append({"match_id": mid, "liga": liga,
                                   "home": casa["team"]["displayName"],
@@ -683,13 +700,13 @@ class DataScraper:
                 pesos_lh.append(((uh["xg5"] + ua["xga5"]) / 2 * 1.05, 0.6))   # +5% casa
                 pesos_la.append(((ua["xg5"] + uh["xga5"]) / 2 * 0.95, 0.6))
                 fontes.append("understat")
-        if elos and fuzzproc and not fontes:
+        if elos and fuzzproc:
             hh = fuzzproc.extractOne(home, list(elos), scorer=fuzz.token_set_ratio, score_cutoff=78)
             aa = fuzzproc.extractOne(away, list(elos), scorer=fuzz.token_set_ratio, score_cutoff=78)
             if hh and aa:
                 lh_e, la_e = MathEngine.lambdas_de_elo(elos[hh[0]], elos[aa[0]])
-                pesos_lh.append((lh_e, 0.55))
-                pesos_la.append((la_e, 0.55))
+                pesos_lh.append((lh_e, 0.75))
+                pesos_la.append((la_e, 0.75))
                 fontes.append("clubelo")
         base = CFG["baseline"]
         pesos_lh.append((base["home"], 0.4 if fontes else 1.0))
@@ -1425,8 +1442,11 @@ def setup_ui():
             st.caption("Pipeline: Agentes 1-4 em paralelo (NIM) → verificação determinística de EV "
                        "em Python → Agente 5 (juiz) com FASE 0. O EV calculado prevalece sempre "
                        "sobre o que os modelos afirmarem.")
-            with st.expander("Modelos NIM — lê o catálogo da TUA conta", expanded=True):
-                if st.button("🔄 Listar modelos da conta (/v1/models)"):
+            with st.expander("Modelos NIM (Top-5 curado por papel — todos free tier)", expanded=True):
+                st.caption("Cada papel tem 5 candidatos escolhidos à mão. Auto-seleção valida "
+                           "contra a tua conta (algumas contas/regiões não têm todos) e escolhe "
+                           "o primeiro que responder.")
+                if st.button("🔄 Listar modelos da conta (para saber quais estão disponíveis)"):
                     try:
                         rr = requests.get(NIM_MODELS_URL, timeout=25,
                                           headers={"Authorization": f"Bearer {k_nim.strip()}"})
@@ -1436,7 +1456,7 @@ def setup_ui():
                         st.success(f"{len(st.session_state['nim_lista'])} modelos disponíveis.")
                     except Exception as e:
                         st.error(f"Listagem falhou: {e}")
-                if st.button("⭐ Escolher os 5 melhores automaticamente"):
+                if st.button("⭐ Auto-selecionar (valida contra a conta)"):
                     try:
                         lst = st.session_state.get("nim_lista")
                         if not lst:
@@ -1445,29 +1465,33 @@ def setup_ui():
                             rr.raise_for_status()
                             lst = sorted(m["id"] for m in rr.json().get("data", []) if m.get("id"))
                             st.session_state["nim_lista"] = lst
-                        picks = escolher_melhores(lst)
+                        picks = asyncio.run(auto_selecionar(NIM_TOP5, set(lst), k_nim.strip()))
                         db.set_config({f"nim_agente{i}": picks[f"agente{i}"] for i in range(1, 6)})
+                        st.success("Escolhidos: " + " · ".join(f"{k}: {v.split('/')[-1]}"
+                                                                for k, v in picks.items()))
                         st.rerun()
                     except Exception as e:
                         st.error(f"Auto-seleção falhou: {e}")
                 lista = st.session_state.get("nim_lista", [])
+                papeis = {1: "Dados", 2: "Tático", 3: "Matemático/JSON", 4: "Risco", 5: "Juiz"}
                 modelos = {}
                 for i in range(1, 6):
-                    guardado = cfg_db.get(f"nim_agente{i}", NIM_DEFAULTS[f"agente{i}"])
-                    if lista:
-                        ops = ([guardado] if guardado not in lista else []) + lista
-                        modelos[f"agente{i}"] = st.selectbox(f"Agente {i}", ops,
-                                                             index=ops.index(guardado),
-                                                             key=f"nim_m{i}")
-                    else:
-                        modelos[f"agente{i}"] = st.text_input(f"Agente {i}", guardado,
-                                                              key=f"nim_m{i}")
+                    guardado = cfg_db.get(f"nim_agente{i}", NIM_TOP5[f"agente{i}"][0])
+                    ops = list(NIM_TOP5[f"agente{i}"])
+                    if guardado not in ops:
+                        ops = [guardado] + ops
+                    marca = {m: (" ✓" if lista and m in lista else " ⚠" if lista else "")
+                             for m in ops}
+                    idx = ops.index(guardado)
+                    modelos[f"agente{i}"] = st.selectbox(
+                        f"Agente {i} — {papeis[i]}", ops, index=idx, key=f"nim_m{i}",
+                        format_func=lambda m: m + marca.get(m, ""))
                 cA, cB, cC = st.columns(3)
                 if cA.button("Guardar modelos"):
                     db.set_config({f"nim_agente{i}": modelos[f"agente{i}"] for i in range(1, 6)})
                     st.success("Modelos guardados.")
-                if cB.button("Repor sugestões 2026"):
-                    db.set_config({f"nim_agente{i}": NIM_DEFAULTS[f"agente{i}"] for i in range(1, 6)})
+                if cB.button("Repor 1ª sugestão de cada papel"):
+                    db.set_config({f"nim_agente{i}": NIM_TOP5[f"agente{i}"][0] for i in range(1, 6)})
                     st.rerun()
                 if cC.button("Testar os 5 agentes"):
                     c5 = AgentCouncil(k_nim, modelos)
