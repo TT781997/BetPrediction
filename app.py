@@ -144,9 +144,48 @@ def montar_dossier(nome, liga, hora, lam, fontes_lam, odds_pre, notas, calib):
     return "\n".join(linhas)
 
 
-ESPN_LEAGUES = ["fifa.world", "uefa.champions", "uefa.europa", "uefa.europa.conf",
-                "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "por.1", "ned.1", "tur.1",
-                "sco.1", "bel.1", "usa.1", "bra.1", "arg.1", "nor.1", "swe.1", "jpn.1"]
+# ---- Presets ESPN ----
+# 'Pedido do utilizador' cobre o que a ESPN expoe da lista: Mundial, Euro, Copa America,
+# Africa Cup, Gold Cup, Mundial de Clubes, Champions/Europa/Conference, Liga Portugal,
+# top-5 europeias e as 2ªs divisões que a ESPN serve (eng.2 = Championship, esp.2 = LaLiga 2,
+# ger.2 = 2. Bundesliga, fifa.wwc = Mundial Feminino, uefa.weuro = Euro Feminino).
+# Olimpíadas e Intercontinental FIFA são competições curtas — só aparecem no periodo em que
+# se disputam (o preset inclui os codigos, ficam inertes o resto do ano).
+ESPN_PRESETS = {
+    "Pedido do utilizador": [
+        "fifa.world", "fifa.wwc", "fifa.olympics", "fifa.w.olympics", "fifa.cwc",
+        "uefa.euro", "uefa.weuro", "conmebol.america", "concacaf.gold", "caf.nations",
+        "uefa.champions", "uefa.europa", "uefa.europa.conf",
+        "eng.1", "eng.2", "esp.1", "esp.2", "ger.1", "ger.2",
+        "ita.1", "fra.1", "por.1",
+    ],
+    "Cobertura larga (default)": [
+        "fifa.world", "uefa.champions", "uefa.europa", "uefa.europa.conf",
+        "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "por.1", "ned.1", "tur.1",
+        "sco.1", "bel.1", "usa.1", "bra.1", "arg.1", "nor.1", "swe.1", "jpn.1",
+    ],
+}
+ESPN_LEAGUES = ESPN_PRESETS["Pedido do utilizador"]
+
+# Filtro de EXIBIÇÃO no Radar (aplica-se aos nomes reais das ligas, venham de onde vierem).
+# É a rede de captura para o que o utilizador quer ver — resistente a diferenças de nome
+# entre football-data e ESPN (ex: "Championship" vs "English League Championship").
+FILTRO_LIGAS_PT = [
+    r"\bworld cup\b", r"\bmundial\b", r"copa do mundo",
+    r"\beuro(pean)? championship\b", r"eurocopa",
+    r"copa am[eé]rica", r"gold cup", r"copa oro",
+    r"africa cup", r"\bcaf nations\b", r"copa africana",
+    r"olympic", r"ol[íi]mpic",
+    r"club world cup", r"mundial de clubes",
+    r"intercontinental",
+    r"champions league", r"europa league", r"conference league",
+    r"premier league", r"championship\b",   # eng 1 e 2
+    r"bundesliga",                             # apanha 1 e 2
+    r"laliga|la liga|primera divisi[oó]n", r"laliga 2|segunda divisi[oó]n",
+    r"italian serie a", r"(?<!ecuadorian )(?<!brazilian )(?<!portuguese )\bserie a\b(?! do)",
+    r"ligue 1\b",
+    r"primeira liga|liga portugal",
+]
 
 MARKET_LABELS = {
     "home": "Vitória Casa", "draw": "Empate", "away": "Vitória Fora",
@@ -1129,11 +1168,22 @@ def setup_ui():
         data_sel = c1.date_input("Dia", dt.date.today(),
                                  help="Dia dos jogos a carregar. O pipeline pré-jogo corre uma vez "
                                       "por clique (não em loop) e guarda os λ em session_state.")
-        ligas_txt = c2.text_input("Ligas ESPN (fallback)", ",".join(ESPN_LEAGUES),
-                                  help="Códigos ESPN separados por vírgula (ex: uefa.champions, por.1, "
-                                       "bra.1). O scraper tenta primeiro o código 'all' (tudo do dia); "
-                                       "se a ESPN não o servir, itera esta lista. Acrescenta aqui "
-                                       "pré-eliminatórias/ligas que faltem.")
+        preset = c2.selectbox("Preset de ligas ESPN", list(ESPN_PRESETS),
+                              help="'Pedido do utilizador' = Mundial (M/F/Olímpico), Copa América, "
+                                   "Euro (M/F), Gold Cup, CAN, Mundial de Clubes, Champions/Europa/"
+                                   "Conference, top-5 europeias + 2ªs divisões inglesa/espanhola/"
+                                   "alemã + Liga Portugal. Alterna para 'Cobertura larga' para "
+                                   "apanhar Brasileirão, MLS, J-League, etc.")
+        ligas_txt = c2.text_input("Códigos ESPN (editáveis; separados por vírgula)",
+                                  ",".join(ESPN_PRESETS[preset]),
+                                  help="Estes códigos controlam APENAS o fallback da ESPN. O "
+                                       "football-data.org devolve o que a chave permite. O que "
+                                       "aparece na tabela depende do filtro por nome de liga abaixo.")
+        filtrar_pt = c2.checkbox("Filtrar tabela pelo pedido (Mundial, Euro, top-5 + 2ªs divisões, "
+                                 "Liga Portugal, competições de seleções)", value=True,
+                                 help="Aplica um filtro por nome de liga ao que sair das fontes — "
+                                     "captura Bundesliga 2, La Liga 2, femininas, olímpicas, etc., "
+                                     "venham de football-data ou da ESPN.")
         if c1.button("Correr pipeline do dia", type="primary") or "radar" not in st.session_state:
             try:
                 ligas = [x.strip() for x in ligas_txt.split(",") if x.strip()]
@@ -1192,6 +1242,13 @@ def setup_ui():
             df = pd.DataFrame(linhas)
             if ocultar and "finished" in df.columns:
                 df = df[~df["finished"].fillna(False)]
+            if filtrar_pt and "liga" in df.columns and not df.empty:
+                pat = re.compile("|".join(FILTRO_LIGAS_PT), re.I)
+                antes = len(df)
+                df = df[df["liga"].fillna("").str.contains(pat)]
+                st.caption(f"Filtro por pedido: {len(df)}/{antes} jogos após filtrar por "
+                           "Mundial/Euro/Copa América/CAN/Olímpicos/top-5+2ªs+Portugal. "
+                           "Desmarca a caixa para veres tudo.")
             if ordem == "Melhor EV" and "ev_val" in df.columns:
                 df = df.sort_values("ev_val", ascending=False, na_position="last")
             vis = df[["liga", "home", "away", "hora_utc", "lh", "la",
